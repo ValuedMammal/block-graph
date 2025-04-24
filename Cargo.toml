@@ -1,0 +1,8 @@
+[package]
+name = "block-graph"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bitcoin = { version = "0.32.5", features = ["std", "serde"] }
+serde = { version = "1", features = ["derive"] }
