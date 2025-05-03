@@ -4,7 +4,7 @@ use std::fmt;
 
 use bitcoin::{block::Header, constants, hashes::Hash, BlockHash, Network};
 
-/// Block id
+/// Block id.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -69,15 +69,15 @@ impl ToBlockId for BlockId {
     }
 }
 
-/// A node in the block graph
+/// A node in the block graph.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Node<T> {
-    /// Block data
+    /// Block data.
     data: T,
 
-    /// Connections
+    /// Set of the node's parents.
     ///
-    /// In a sparse chain a node may connect to multiple previous blocks
+    /// In a sparse chain a node may connect to multiple previous blocks.
     conn: BTreeSet<BlockId>,
 }
 
@@ -122,17 +122,17 @@ impl<T: ToBlockId> Node<T> {
     }
 }
 
-/// Block graph
+/// `BlockGraph`.
 ///
-/// Internally modeled as a rooted, directed, acyclic graph where the nodes are blocks
-/// and the edges are hashes.
+/// Internally modeled as a directed, acyclic graph (rooted in the genesis block) where
+/// the nodes are blocks and the edges are hashes.
 #[derive(Debug, Clone)]
 pub struct BlockGraph<T> {
     /// Nodes by block hash
     blocks: HashMap<BlockHash, Node<T>>,
-    /// Next hashes, the set of blocks that connect to a given node
+    /// Next hashes, represents the set of blocks that extend a given node
     next_hashes: HashMap<BlockHash, HashSet<BlockHash>>,
-    /// the root hash aka genesis
+    /// The root hash, aka genesis
     root: BlockHash,
     /// Hash of the current chain tip
     tip: BlockHash,
@@ -148,6 +148,7 @@ pub struct BlockGraph<T> {
 // - Update best chain
 // - impl to/from ChangeSet
 // - sparse chain
+// - handles reorgs
 // - HeaderId chain
 // - BlockId chain
 
@@ -429,8 +430,7 @@ impl<T: ToBlockId + Clone> BlockGraph<T> {
                     return true;
                 }
                 // If validity can't be determined from the tip then we have to do an
-                // exhaustive search of the chain in question to see if it contains the
-                // genesis block.
+                // exhaustive search to see if it contains the genesis block.
                 if self
                     .iter_blocks(&node.hash())
                     .any(|item| item.block_id() == genesis_block)
@@ -460,7 +460,7 @@ impl<T: ToBlockId + Clone> BlockGraph<T> {
                     .then_with(|| match a.hash.cmp(&b.hash) {
                         cmp::Ordering::Less => cmp::Ordering::Greater,
                         cmp::Ordering::Greater => cmp::Ordering::Less,
-                        _ => unreachable!(),
+                        _ => unreachable!("must not have duplicate tips"),
                     })
             })?;
 
