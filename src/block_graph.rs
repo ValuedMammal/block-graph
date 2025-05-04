@@ -75,10 +75,10 @@ pub struct Node<T> {
     /// Block data.
     data: T,
 
-    /// Set of the node's parents.
+    /// Set of the node's ancestors.
     ///
-    /// In a sparse chain a node may connect to multiple previous blocks.
-    conn: BTreeSet<BlockId>,
+    /// In a sparse chain a node may point to multiple previous blocks.
+    ancestors: BTreeSet<BlockId>,
 }
 
 impl<T: ToBlockId> Node<T> {
@@ -86,7 +86,7 @@ impl<T: ToBlockId> Node<T> {
     pub fn new(data: T, conn: BlockId) -> Self {
         Self {
             data,
-            conn: [conn].into(),
+            ancestors: [conn].into(),
         }
     }
 
@@ -110,15 +110,19 @@ impl<T: ToBlockId> Node<T> {
         &self.data
     }
 
-    /// Iterate over all connections of this node
-    pub fn connections(&self) -> impl Iterator<Item = &BlockId> {
-        self.conn.iter()
+    /// Iterate over the ancestors of this node
+    pub fn ancestors(&self) -> impl Iterator<Item = &BlockId> {
+        self.ancestors.iter()
     }
 
-    /// Return the *most recent* connection of this node, i.e. the highest block
+    /// Return the *most recent* ancestor of this node, i.e. the highest block
     /// by height that this node connects to.
     pub fn connected_at(&self) -> BlockId {
-        self.conn.iter().last().copied().expect("node must have a connection")
+        self.ancestors
+            .iter()
+            .last()
+            .copied()
+            .expect("node must have a connection")
     }
 }
 
@@ -126,7 +130,7 @@ impl<T: ToBlockId> Node<T> {
 ///
 /// Internally modeled as a directed, acyclic graph (rooted in the genesis block) where
 /// the nodes are blocks and the edges are hashes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockGraph<T> {
     /// Nodes by block hash
     blocks: HashMap<BlockHash, Node<T>>,
@@ -142,61 +146,7 @@ pub struct BlockGraph<T> {
     tips: HashSet<BlockHash>,
 }
 
-// Features
-// - Connect blocks to graph
-// - Iterate blocks of the main chain
-// - Update best chain
-// - impl to/from ChangeSet
-// - sparse chain
-// - handles reorgs
-// - HeaderId chain
-// - BlockId chain
-
-// Ways to connect a block
-// case: extend main chain
-// 0
-// 0--A
-
-// case: extend a candidate tip
-// 0--A--B
-// 0--A--Ba
-
-// case: switch forks (reorg)
-// 0--1--A
-// 0--1--Aa--Ba
-
-// case: add orphan block (no parent)
-// 0--A--B
-//      -Bh
-
-// case: insert block into main chain
-// 2 operations: connect-block (A->0), add-dependency (B->A)
-// 0-----B
-// 0--A--B
-
-// How to manage tips
-// HashSet<BlockHash>
-// when a block is connected
-//   remove its parent from tips
-//   add this block to tips
-// reevaluate valid tips to find the best one
-
-// Can we optimize for faster indexing?
-// reintroduce canonical index as a contiguous array of Arc<T>
-// periodically do work to reconstruct the index
-// actions that trigger a reindex?
-// - connecting blocks out of order
-
-// Definition of "best" chain
-// The best chain is the longest by block height. The reason not to use Work is because
-// in a sparse chain the accumulated work may be artificially low, so going by work alone
-// could cause us to wrongfully switch to a shorter but heavier chain.
-
-// If two tips are tied for longest chain, then we tie-break by blockhash
-// (rationale: smaller hash -> more work)
-// if we guess wrong, we'll just resume on whichever chain is extended
-
-impl<T: ToBlockId + Clone> BlockGraph<T> {
+impl<T: ToBlockId + Ord + Clone> BlockGraph<T> {
     /// Construct from genesis block
     ///
     /// Panics if the height of the genesis block is not 0.
@@ -235,51 +185,59 @@ impl<T: ToBlockId + Clone> BlockGraph<T> {
     }
 
     /// Add an edge to the graph. Will be `None` if no entry is found in graph for the given
-    /// `hash`.
+    /// `hash` or if adding the edge would result in an invalid dependency.
     ///
-    /// Adding an edge signifies that the Node at `hash` connects to the parent chain at `conn`.
-    /// We can draw a number of implications as a result:
+    /// Adding an edge signifies that the Node at `hash` connects to the parent chain at `par`.
+    /// We can draw a number of conclusions as a result:
     ///
-    /// - If the node at `hash` is reachable from the tip, we can deduce that `conn` is also
+    /// - If the node at `hash` is reachable from the tip, we can deduce that `par` is also
     ///   reachable from the tip.
-    pub fn add_dependency(&mut self, hash: BlockHash, conn: BlockId) -> Option<ChangeSet<T>> {
-        let mut change = ChangeSet::default();
+    pub fn add_dependency(&mut self, hash: BlockHash, par: BlockId) -> Option<ChangeSet<T>> {
+        let mut changeset = ChangeSet::default();
 
         let node = self.blocks.get_mut(&hash)?;
-        if node.conn.insert(conn) {
-            change.blocks.push((node.data.clone(), conn));
+
+        // Avoid introducing an invalid dependency
+        if par.height >= node.height() {
+            return None;
+        }
+
+        // Now we can add the parent
+        if node.ancestors.insert(par) {
+            changeset.blocks.insert((node.data.clone(), par));
         }
 
         // Update edges
-        self.next_hashes.entry(conn.hash).or_default().insert(hash);
+        self.next_hashes.entry(par.hash).or_default().insert(hash);
 
-        Some(change)
+        Some(changeset)
     }
 
-    /// Connect a `block` to the graph which connects to the node referenced by `conn`.
-    pub fn connect_block(&mut self, block: T, conn: BlockId) -> ChangeSet<T> {
+    /// Connect a `block` to the graph which connects to the parent node referenced by `par`.
+    pub fn connect_block(&mut self, block: T, par: BlockId) -> ChangeSet<T> {
         let mut changeset = ChangeSet::default();
         let block_id = block.block_id();
         let hash = block_id.hash;
 
-        // Avoid connecting a node to itself or introducing an invalid dependency
-        if block_id == conn || conn.height > block_id.height {
+        // Handle invalid connections by returning an empty changeset
+        if par.height >= block_id.height {
             return changeset;
         }
-        assert!(block_id.height > conn.height);
 
         // An entry exists for this hash, add the edge and return
         if self.blocks.contains_key(&hash) {
-            return self.add_dependency(hash, conn).expect("node must exist");
+            return self.add_dependency(hash, par).unwrap_or_default();
         }
 
-        // Add this node, and record the fact that this block extends from the previous
-        self.blocks.insert(hash, Node::new(block.clone(), conn));
-        self.next_hashes.entry(conn.hash).or_default().insert(hash);
-        changeset.blocks.push((block, conn));
+        assert!(block_id.height > par.height);
+
+        // Add this node, and record that this block extends from its parent
+        self.blocks.insert(hash, Node::new(block.clone(), par));
+        self.next_hashes.entry(par.hash).or_default().insert(hash);
+        changeset.blocks.insert((block, par));
 
         // Remove the parent from tips if present
-        let tip_extended = self.tips.remove(&conn.hash);
+        let tip_extended = self.tips.remove(&par.hash);
         // If nothing extends from this block, considering adding it as a tip
         if !self.next_hashes.contains_key(&hash) {
             // If the block extends a previous tip, it necessarily becomes the new tip
@@ -291,7 +249,7 @@ impl<T: ToBlockId + Clone> BlockGraph<T> {
         }
 
         // If the block extends the current tip, update the tip and return
-        if conn.hash == self.tip {
+        if par.hash == self.tip {
             self.tip = hash;
             return changeset;
         }
@@ -312,10 +270,10 @@ impl<T: ToBlockId + Clone> BlockGraph<T> {
     /// Obtain the initial [`ChangeSet`] of this block graph. The initial changeset
     /// is the difference between `self` and an empty graph.
     pub fn initial_changeset(&self) -> ChangeSet<T> {
-        let mut blocks = vec![];
+        let mut blocks = BTreeSet::new();
         for node in self.blocks.values() {
-            for &conn in node.connections() {
-                blocks.push((node.data.clone(), conn));
+            for &par in node.ancestors() {
+                blocks.insert((node.data.clone(), par));
             }
         }
 
@@ -325,30 +283,41 @@ impl<T: ToBlockId + Clone> BlockGraph<T> {
     /// Construct from [`ChangeSet`].
     ///
     /// Errors if changeset is empty, or does not contain a genesis block.
-    pub fn from_changeset(changeset: ChangeSet<T>) -> Result<Self, MissingGenesisError>
-    where
-        T: Ord,
-    {
-        let blocks: BTreeSet<(T, BlockId)> = changeset.blocks.into_iter().collect();
-
-        let (genesis, _) = blocks.first().cloned().ok_or(MissingGenesisError)?;
-
-        if genesis.block_id().height != 0 {
-            return Err(MissingGenesisError);
-        }
+    pub fn from_changeset(changeset: ChangeSet<T>) -> Result<Self, MissingGenesisError> {
+        let (genesis, _) = changeset
+            .blocks
+            .iter()
+            .find(|(b, _)| b.block_id().height == 0)
+            .cloned()
+            .ok_or(MissingGenesisError)?;
 
         let mut graph = BlockGraph::from_genesis(genesis);
 
-        for (block, conn) in blocks {
-            let _ = graph.connect_block(block, conn);
+        for (block, par) in changeset.blocks {
+            let hash = block.block_id().hash;
+            if hash == graph.root {
+                continue;
+            }
+            // populate nodes
+            graph.blocks.insert(hash, Node::new(block, par));
+            // populate edges
+            graph.next_hashes.entry(par.hash).or_default().insert(hash);
         }
+
+        // reindex
+        graph.reindex();
 
         Ok(graph)
     }
 
-    /// Get the genesis node
-    pub fn genesis_node(&self) -> &Node<T> {
+    /// Returns the root node
+    fn genesis_node(&self) -> &Node<T> {
         self.blocks.get(&self.root).expect("must have node")
+    }
+
+    /// Get the genesis hash
+    pub fn genesis_hash(&self) -> BlockHash {
+        self.root
     }
 
     /// Get block id by height
@@ -427,19 +396,20 @@ impl<T: ToBlockId + Clone> BlockGraph<T> {
                 // If a parent is found to be in the best chain, we can deduce
                 // that this is a valid chain.
                 if let Some(true) = self.is_block_in_chain(node.block_id(), chain_tip) {
+                    println!("Found parent in main chain");
                     return true;
                 }
-                // If validity can't be determined from the tip then we have to do an
-                // exhaustive search to see if it contains the genesis block.
-                if self
-                    .iter_blocks(&node.hash())
-                    .any(|item| item.block_id() == genesis_block)
+                // If validity can't be determined by the current tip then we iterate blocks of
+                // the chain we're considering and see if it leads back to genesis.
+                if self.iter_blocks(&node.hash()).last().map(|item| item.block_id())
+                    == Some(genesis_block)
                 {
+                    println!("Found genesis");
                     return true;
                 }
-                let connections =
-                    node.connections().map(|b| b.hash).filter(|&hash| visited.insert(hash));
-                to_validate.extend(connections);
+                let ancestors =
+                    node.ancestors().map(|b| b.hash).filter(|&hash| visited.insert(hash));
+                to_validate.extend(ancestors);
             }
         }
 
@@ -460,20 +430,20 @@ impl<T: ToBlockId + Clone> BlockGraph<T> {
                     .then_with(|| match a.hash.cmp(&b.hash) {
                         cmp::Ordering::Less => cmp::Ordering::Greater,
                         cmp::Ordering::Greater => cmp::Ordering::Less,
-                        _ => unreachable!("must not have duplicate tips"),
+                        cmp::Ordering::Equal => unreachable!("must not have duplicate tips"),
                     })
             })?;
 
-        // Update to the best tip if needed
-        if self.tip() == best_block {
-            println!("Compare tips resulted in no change");
-            None
-        } else {
-            println!("Setting new tip {} {}", best_block.height, best_block.hash);
+        // Update to the new best tip if necessary
+        if self.tip() != best_block {
+            println!("New tip {} {}", best_block.height, best_block.hash);
             let old_tip = self.tip;
             self.tip = best_block.hash;
-            Some(old_tip)
+            return Some(old_tip);
         }
+
+        println!("Compare tips resulted in no change");
+        None
     }
 }
 
@@ -497,7 +467,7 @@ pub trait ChainOracle {
     fn is_block_in_chain(&self, block: BlockId, chain_tip: BlockId) -> Option<bool>;
 }
 
-impl<T: ToBlockId + Clone> ChainOracle for BlockGraph<T> {
+impl<T: ToBlockId + Ord + Clone> ChainOracle for BlockGraph<T> {
     fn get_chain_tip(&self) -> BlockId {
         let hash = self.tip;
         let height = self.blocks.get(&hash).expect("should have tip node").height();
@@ -523,12 +493,12 @@ impl<T: ToBlockId + Clone> ChainOracle for BlockGraph<T> {
 
 /// Records changes and additions to the block graph
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ChangeSet<T> {
-    /// tuples of (block, connected_at)
-    blocks: Vec<(T, BlockId)>,
+pub struct ChangeSet<T: Ord> {
+    /// tuples of (block, parent)
+    blocks: BTreeSet<(T, BlockId)>,
 }
 
-impl<T> Default for ChangeSet<T> {
+impl<T: Ord> Default for ChangeSet<T> {
     fn default() -> Self {
         Self {
             blocks: Default::default(),
@@ -536,7 +506,7 @@ impl<T> Default for ChangeSet<T> {
     }
 }
 
-impl<T> ChangeSet<T> {
+impl<T: Ord> ChangeSet<T> {
     /// Merge
     pub fn merge(&mut self, other: Self) {
         self.blocks.extend(other.blocks);
@@ -566,7 +536,7 @@ mod test {
         }
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
     struct SimpleHeader {
         height: u32,
         hash: BlockHash,
@@ -693,6 +663,13 @@ mod test {
         assert!(!cs.blocks.is_empty());
         assert_eq!(graph.tip().height, 1);
 
+        // attempting to reconnect the genesis block should not
+        // add edges superfluously
+        let genesis_par = graph.node(&og_tip.hash).unwrap().connected_at();
+        assert_eq!(genesis_par.hash, BlockHash::all_zeros());
+        let cs = graph.connect_block(genesis_header, genesis_par);
+        assert!(cs.blocks.is_empty());
+
         // Now reconnect the same header to the original tip
         let cs = graph.connect_block(header_1, og_tip);
         assert!(cs.blocks.is_empty());
@@ -733,8 +710,7 @@ mod test {
         let blocks: Vec<SimpleHeader> = graph.iter().copied().collect();
         assert_eq!(blocks.len(), 5);
 
-        // try reindex with debug prints
-        graph.reindex();
+        dbg!(&graph);
     }
 
     #[test]
@@ -986,5 +962,36 @@ mod test {
 
         assert_eq!(graph.tips.len(), 3);
         assert_eq!(graph.tip(), block_4);
+    }
+
+    #[test]
+    fn test_from_changeset() {
+        const BLOCK_CT: usize = 5;
+
+        let gen = BlockId {
+            height: 0,
+            hash: constants::genesis_block(Network::Regtest).block_hash(),
+        };
+        let mut graph = BlockGraph::from_genesis(gen);
+
+        for i in 0..BLOCK_CT {
+            let height = i as u32 + 1;
+
+            let block = BlockId {
+                height,
+                hash: Hash::hash(height.to_be_bytes().as_slice()),
+            };
+            let _ = graph.connect_block(block, graph.tip());
+        }
+
+        assert_eq!(graph.blocks.len(), (BLOCK_CT + 1));
+
+        let changeset = graph.initial_changeset();
+        assert_eq!(changeset.blocks.len(), (BLOCK_CT + 1));
+
+        // now recover from changeset
+        let recovered =
+            BlockGraph::from_changeset(changeset).expect("should construct from changeset");
+        assert_eq!(recovered, graph);
     }
 }
