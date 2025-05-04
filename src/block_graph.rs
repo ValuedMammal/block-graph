@@ -385,7 +385,7 @@ impl<T: ToBlockId + Ord + Clone> BlockGraph<T> {
                     return true;
                 }
                 // If validity can't be determined by the current tip then we iterate blocks of
-                // the chain we're considering and see if ends at the genesis block.
+                // the chain we're considering and see if it ends at the genesis block.
                 if self.iter_blocks(&node.hash()).last().map(|item| item.block_id())
                     == Some(genesis_block)
                 {
@@ -402,22 +402,15 @@ impl<T: ToBlockId + Ord + Clone> BlockGraph<T> {
     }
 
     /// Compare all tips of `self` and set the new best hash, returning the old tip if it changed.
+    ///
+    /// The best block is defined as the tip of the longest chain, or in case of a tie, the tip
+    /// with the smallest block hash, as it implies more work.
     fn compare_tips(&mut self) -> Option<BlockHash> {
         let best_block = self
             .tips
             .iter()
             .flat_map(|hash| Some(self.blocks.get(hash)?.block_id()))
-            .max_by(|a, b| {
-                // Compare by height
-                a.height
-                    .cmp(&b.height)
-                    // Tie-break by hash, smaller is better since it implies more work.
-                    .then_with(|| match a.hash.cmp(&b.hash) {
-                        cmp::Ordering::Less => cmp::Ordering::Greater,
-                        cmp::Ordering::Greater => cmp::Ordering::Less,
-                        cmp::Ordering::Equal => unreachable!("must not have duplicate tips"),
-                    })
-            })?;
+            .max_by_key(|b| (b.height, cmp::Reverse(b.hash)))?;
 
         // Update to the new best tip if necessary
         if self.tip() != best_block {
