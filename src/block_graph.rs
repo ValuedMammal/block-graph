@@ -4,25 +4,10 @@ use std::fmt;
 
 use bitcoin::{block::Header, constants, hashes::Hash, BlockHash, Network};
 
-/// Block id.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-)]
-pub struct BlockId {
-    /// height
-    pub height: u32,
-    /// hash
-    pub hash: BlockHash,
-}
-
-impl Default for BlockId {
-    fn default() -> Self {
-        Self {
-            height: Default::default(),
-            hash: constants::genesis_block(Network::Bitcoin).block_hash(),
-        }
-    }
-}
+use bdk_chain::{
+    bdk_core::{BlockId, Merge},
+    ChainOracle,
+};
 
 /// Block header id
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -115,8 +100,8 @@ impl<T: ToBlockId> Node<T> {
         self.ancestors.iter()
     }
 
-    /// Return the *most recent* ancestor of this node, i.e. the highest block
-    /// by height that this node connects to.
+    /// Return the *most recent* ancestor of this node, i.e. the ancestor of this node with
+    /// the greatest height.
     pub fn connected_at(&self) -> BlockId {
         self.ancestors
             .iter()
@@ -262,8 +247,8 @@ impl<T: ToBlockId + Ord + Clone> BlockGraph<T> {
 
     /// Applies the given changeset
     pub fn apply_changeset(&mut self, changeset: ChangeSet<T>) {
-        for (block, conn) in changeset.blocks {
-            let _ = self.connect_block(block, conn);
+        for (block, par) in changeset.blocks {
+            let _ = self.connect_block(block, par);
         }
     }
 
@@ -332,7 +317,7 @@ impl<T: ToBlockId + Ord + Clone> BlockGraph<T> {
 
     /// Get the chain tip block id
     pub fn tip(&self) -> BlockId {
-        self.get_chain_tip()
+        self.get_chain_tip().expect("infallible")
     }
 
     /// Iterate elements of `&T` in descending height order from the tip of the active chain.
@@ -395,12 +380,12 @@ impl<T: ToBlockId + Ord + Clone> BlockGraph<T> {
             if let Some(node) = self.blocks.get(&hash) {
                 // If a parent is found to be in the best chain, we can deduce
                 // that this is a valid chain.
-                if let Some(true) = self.is_block_in_chain(node.block_id(), chain_tip) {
+                if let Ok(Some(true)) = self.is_block_in_chain(node.block_id(), chain_tip) {
                     println!("Found parent in main chain");
                     return true;
                 }
                 // If validity can't be determined by the current tip then we iterate blocks of
-                // the chain we're considering and see if it leads back to genesis.
+                // the chain we're considering and see if ends at the genesis block.
                 if self.iter_blocks(&node.hash()).last().map(|item| item.block_id())
                     == Some(genesis_block)
                 {
@@ -459,35 +444,33 @@ impl fmt::Display for MissingGenesisError {
 
 impl std::error::Error for MissingGenesisError {}
 
-/// Chain oracle
-pub trait ChainOracle {
-    /// Get chain tip
-    fn get_chain_tip(&self) -> BlockId;
-    /// Is block in chain with chain tip
-    fn is_block_in_chain(&self, block: BlockId, chain_tip: BlockId) -> Option<bool>;
-}
-
 impl<T: ToBlockId + Ord + Clone> ChainOracle for BlockGraph<T> {
-    fn get_chain_tip(&self) -> BlockId {
-        let hash = self.tip;
-        let height = self.blocks.get(&hash).expect("should have tip node").height();
+    type Error = core::convert::Infallible;
 
-        BlockId { height, hash }
+    fn get_chain_tip(&self) -> Result<BlockId, Self::Error> {
+        let hash = self.tip;
+        let height = self.blocks.get(&hash).expect("must have tip node").height();
+
+        Ok(BlockId { height, hash })
     }
 
-    fn is_block_in_chain(&self, block: BlockId, chain_tip: BlockId) -> Option<bool> {
+    fn is_block_in_chain(
+        &self,
+        block: BlockId,
+        chain_tip: BlockId,
+    ) -> Result<Option<bool>, Self::Error> {
         // The block cannot be in chain if its height is not within `chain_tip`
         if block.height > chain_tip.height {
-            return None;
+            return Ok(None);
         }
         // We can't determine if block is in chain if `chain_tip` is
         // not part of the best chain
         if self.get(chain_tip.height) != Some(chain_tip) {
-            return None;
+            return Ok(None);
         }
         // If `block` is reachable from the tip and the hashes match, then it
         // is also part of the best chain.
-        self.get(block.height).map(|b| b.hash == block.hash)
+        Ok(self.get(block.height).map(|b| b.hash == block.hash))
     }
 }
 
@@ -506,13 +489,11 @@ impl<T: Ord> Default for ChangeSet<T> {
     }
 }
 
-impl<T: Ord> ChangeSet<T> {
-    /// Merge
-    pub fn merge(&mut self, other: Self) {
+impl<T: Ord> Merge for ChangeSet<T> {
+    fn merge(&mut self, other: Self) {
         self.blocks.extend(other.blocks);
     }
-    /// Is empty
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.blocks.is_empty()
     }
 }
@@ -709,8 +690,6 @@ mod test {
 
         let blocks: Vec<SimpleHeader> = graph.iter().copied().collect();
         assert_eq!(blocks.len(), 5);
-
-        dbg!(&graph);
     }
 
     #[test]

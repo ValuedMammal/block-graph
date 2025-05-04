@@ -4,5 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+bdk_chain = { version = "0.22.0", default-features = false, features = ["serde"] }
 bitcoin = { version = "0.32.5", features = ["std", "serde"] }
 serde = { version = "1", features = ["derive"] }
