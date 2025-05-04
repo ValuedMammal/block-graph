@@ -2,8 +2,15 @@
 name = "block-graph"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.63.0"
+readme = "README.md"
 
 [dependencies]
-bdk_chain = { version = "0.22.0", default-features = false, features = ["serde"] }
-bitcoin = { version = "0.32.5", features = ["std", "serde"] }
-serde = { version = "1", features = ["derive"] }
+bdk_chain = { version = "0.22.0", default-features = false }
+bitcoin = { version = "0.32.5", default-features = false }
+serde = { version = "1", default-features = false, features = ["derive"], optional = true }
+
+[features]
+default = ["std", "serde"]
+std = ["bitcoin/std", "bdk_chain/std"]
+serde = ["dep:serde", "bitcoin/serde", "bdk_chain/serde"]

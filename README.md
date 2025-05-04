@@ -35,6 +35,8 @@
   - The `is_valid_chain` method ensures that a chain connects to the genesis block, either directly or indirectly, making it easy to validate the integrity of any chain in the graph.
 - **Best Tip Selection**:
   - The `compare_tips` method dynamically determines the best chain by selecting the longest chain by height. In case of ties, the chain with the smallest block hash is chosen, ensuring determinism.
+- **Chain Oracle**:
+  - As a chain oracle, the `BlockGraph` can return the tip of the active chain using `get_chain_tip`. The `is_block_in_chain` method is used to determine if a given block is reachable from the tip of the active chain.
 
 ---
 

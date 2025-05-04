@@ -468,13 +468,21 @@ impl<T: ToBlockId + Ord + Clone> ChainOracle for BlockGraph<T> {
 }
 
 /// Records changes and additions to the block graph
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ChangeSet<T: Ord> {
+#[derive(Debug, Clone)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Deserialize, serde::Serialize),
+    serde(bound(
+        deserialize = "T: Ord + serde::Deserialize<'de>",
+        serialize = "T: Ord + serde::Serialize",
+    ))
+)]
+pub struct ChangeSet<T> {
     /// tuples of (block, parent)
     blocks: BTreeSet<(T, BlockId)>,
 }
 
-impl<T: Ord> Default for ChangeSet<T> {
+impl<T> Default for ChangeSet<T> {
     fn default() -> Self {
         Self {
             blocks: Default::default(),
@@ -940,11 +948,11 @@ mod test {
     fn test_from_changeset() {
         const BLOCK_CT: usize = 5;
 
-        let gen = BlockId {
+        let genesis = BlockId {
             height: 0,
             hash: constants::genesis_block(Network::Regtest).block_hash(),
         };
-        let mut graph = BlockGraph::from_genesis(gen);
+        let mut graph = BlockGraph::from_genesis(genesis);
 
         for i in 0..BLOCK_CT {
             let height = i as u32 + 1;
