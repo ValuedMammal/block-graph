@@ -1,13 +1,18 @@
-use std::cmp;
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::fmt;
+//! [`BlockGraph`].
 
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt;
+use std::sync::Arc;
+
+use bdk_chain::local_chain::MissingGenesisError;
 use bitcoin::{block::Header, constants, hashes::Hash, BlockHash, Network};
 
 use bdk_chain::{
     bdk_core::{BlockId, Merge},
-    ChainOracle,
+    bitcoin,
 };
+
+use crate::List;
 
 /// Block header id
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -33,9 +38,9 @@ impl Default for BlockHeaderId {
     }
 }
 
-/// trait ToBlockId
+/// Trait for types that can derive a `BlockId`.
 pub trait ToBlockId {
-    /// Return the identity of the block
+    /// Return the identity of the block.
     fn block_id(&self) -> BlockId;
 }
 
@@ -54,421 +59,167 @@ impl ToBlockId for BlockId {
     }
 }
 
-/// A node in the block graph.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Node<T> {
-    /// Block data.
-    data: T,
-
-    /// Set of the node's ancestors.
-    ///
-    /// In a sparse chain a node may point to multiple previous blocks.
-    ancestors: BTreeSet<BlockId>,
-}
-
-impl<T: ToBlockId> Node<T> {
-    /// New from `data` and block id of the connection `conn`
-    pub fn new(data: T, conn: BlockId) -> Self {
-        Self {
-            data,
-            ancestors: [conn].into(),
-        }
-    }
-
-    /// Return the block identity of this node
-    pub fn block_id(&self) -> BlockId {
-        self.data.block_id()
-    }
-
-    /// Return the height of this node
-    pub fn height(&self) -> u32 {
-        self.block_id().height
-    }
-
-    /// Return the block hash of this node
-    pub fn hash(&self) -> BlockHash {
-        self.block_id().hash
-    }
-
-    /// Return the block data of this node
-    pub fn data(&self) -> &T {
-        &self.data
-    }
-
-    /// Iterate over the ancestors of this node
-    pub fn ancestors(&self) -> impl Iterator<Item = &BlockId> {
-        self.ancestors.iter()
-    }
-
-    /// Return the *most recent* ancestor of this node, i.e. the ancestor of this node with
-    /// the greatest height.
-    pub fn connected_at(&self) -> BlockId {
-        self.ancestors
-            .iter()
-            .last()
-            .copied()
-            .expect("node must have a connection")
-    }
-}
-
-/// `BlockGraph`.
-///
-/// Internally modeled as a directed, acyclic graph (rooted in the genesis block) where
-/// the nodes are blocks and the edges are hashes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Block graph.
+#[derive(Debug)]
 pub struct BlockGraph<T> {
-    /// Nodes by block hash
-    blocks: HashMap<BlockHash, Node<T>>,
-    /// Next hashes, represents the set of blocks that extend a given node
+    /// Blocks.
+    blocks: HashMap<BlockHash, T>,
+    /// Next hashes.
     next_hashes: HashMap<BlockHash, HashSet<BlockHash>>,
-    /// The root hash, aka genesis
+    /// The root hash, aka genesis.
     root: BlockHash,
-    /// Hash of the current chain tip
-    tip: BlockHash,
-    /// Candidate tips (forks)
-    ///
-    /// By definition a candidate tip must be a [valid chain](Self::is_valid_chain).
-    tips: HashSet<BlockHash>,
+    /// List.
+    tip: List<T>,
 }
 
-impl<T: ToBlockId + Ord + Clone> BlockGraph<T> {
-    /// Construct from genesis block
-    ///
-    /// Panics if the height of the genesis block is not 0.
+impl<T: ToBlockId + fmt::Debug + Ord + Clone> BlockGraph<T> {
+    /// From genesis `block`.
     pub fn from_genesis(block: T) -> Self {
-        let genesis_block = block.block_id();
-        assert_eq!(genesis_block.height, 0, "genesis block must be root of graph");
-
-        let genesis_hash = genesis_block.hash;
-        let conn = BlockId {
-            height: 0,
-            hash: BlockHash::all_zeros(),
-        };
+        let block_id = block.block_id();
+        assert_eq!(block_id.height, 0, "err: missing genesis");
 
         let mut blocks = HashMap::new();
-        let mut next_hashes = HashMap::new();
-        let mut tips = HashSet::new();
-
-        // populate blocks
-        let node = Node::new(block, conn);
-        blocks.insert(genesis_hash, node);
-        // populate edges
-        next_hashes.entry(genesis_hash).or_default();
-        // store the root hash
-        let root = genesis_hash;
-        // set tip
-        let tip = root;
-        tips.insert(tip);
+        blocks.insert(block_id.hash, block.clone());
+        let next_hashes = HashMap::new();
+        let root = block_id.hash;
+        let tip = List::new(block_id.height, block);
 
         Self {
             blocks,
             next_hashes,
             root,
             tip,
-            tips,
         }
     }
 
-    /// Add an edge to the graph. Will be `None` if no entry is found in graph for the given
-    /// `hash` or if adding the edge would result in an invalid dependency.
+    /// From changeset. None if the `changeset` is empty.
     ///
-    /// Adding an edge signifies that the Node at `hash` connects to the parent chain at `par`.
-    /// We can draw a number of conclusions as a result:
-    ///
-    /// - If the node at `hash` is reachable from the tip, we can deduce that `par` is also
-    ///   reachable from the tip.
-    pub fn add_dependency(&mut self, hash: BlockHash, par: BlockId) -> Option<ChangeSet<T>> {
-        let mut changeset = ChangeSet::default();
-
-        let node = self.blocks.get_mut(&hash)?;
-
-        // Avoid introducing an invalid dependency
-        if par.height >= node.height() {
-            return None;
+    /// The first item in `changeset` must correspond to the "genesis block" or else a
+    /// [`MissingGenesisError`] will occur.
+    pub fn from_changeset(changeset: ChangeSet<T>) -> Result<Option<Self>, MissingGenesisError>
+    where
+        T: Default,
+    {
+        if changeset.is_empty() {
+            return Ok(None);
+        }
+        let (genesis, _par) = changeset.blocks.iter().next().cloned().expect("must not be empty");
+        let genesis_block = genesis.block_id();
+        if genesis_block.height != 0 {
+            return Err(MissingGenesisError);
         }
 
-        // Now we can add the parent
-        if node.ancestors.insert(par) {
-            changeset.blocks.insert((node.data.clone(), par));
-        }
+        let mut graph = Self::from_genesis(genesis);
+        graph.apply_changeset(&changeset);
 
-        // Update edges
-        self.next_hashes.entry(par.hash).or_default().insert(hash);
-
-        Some(changeset)
+        Ok(Some(graph))
     }
 
-    /// Connect a `block` to the graph which connects to the parent node referenced by `par`.
-    pub fn connect_block(&mut self, block: T, par: BlockId) -> ChangeSet<T> {
-        let mut changeset = ChangeSet::default();
-        let block_id = block.block_id();
-        let hash = block_id.hash;
-
-        // Handle invalid connections by returning an empty changeset
-        if par.height >= block_id.height {
-            return changeset;
-        }
-
-        // An entry exists for this hash, add the edge and return
-        if self.blocks.contains_key(&hash) {
-            return self.add_dependency(hash, par).unwrap_or_default();
-        }
-
-        assert!(block_id.height > par.height);
-
-        // Add this node, and record that this block extends from its parent
-        self.blocks.insert(hash, Node::new(block.clone(), par));
-        self.next_hashes.entry(par.hash).or_default().insert(hash);
-        changeset.blocks.insert((block, par));
-
-        // Remove the parent from tips if present
-        let tip_extended = self.tips.remove(&par.hash);
-        // If nothing extends from this block, considering adding it as a tip
-        if !self.next_hashes.contains_key(&hash) {
-            // If the block extends a previous tip, it necessarily becomes the new tip
-            // or if the tip forms a valid chain it may be a fork contender.
-            if tip_extended || self.is_valid_chain(&hash) {
-                println!("Inserting tip {} {}", block_id.height, block_id.hash);
-                assert!(self.tips.insert(hash));
-            }
-        }
-
-        // If the block extends the current tip, update the tip and return
-        if par.hash == self.tip {
-            self.tip = hash;
-            return changeset;
-        }
-
-        // Reevaluate tips to find the best one
-        self.compare_tips();
-
-        changeset
-    }
-
-    /// Applies the given changeset
-    pub fn apply_changeset(&mut self, changeset: ChangeSet<T>) {
-        for (block, par) in changeset.blocks {
-            let _ = self.connect_block(block, par);
-        }
-    }
-
-    /// Obtain the initial [`ChangeSet`] of this block graph. The initial changeset
-    /// is the difference between `self` and an empty graph.
+    /// Initial changeset.
     pub fn initial_changeset(&self) -> ChangeSet<T> {
         let mut blocks = BTreeSet::new();
-        for node in self.blocks.values() {
-            for &par in node.ancestors() {
-                blocks.insert((node.data.clone(), par));
+
+        // Remember to include the root, since it doesn't have a parent entry in `next_hashes`.
+        let genesis_block = self.blocks.get(&self.root).cloned().expect("must contain root");
+        blocks.insert((
+            genesis_block,
+            BlockId {
+                height: 0,
+                hash: BlockHash::all_zeros(),
+            },
+        ));
+
+        for (par_hash, extends) in &self.next_hashes {
+            for hash in extends {
+                // Get block
+                let block = self.blocks.get(hash).cloned().expect("must have block");
+                // Get parent id
+                let par_id = self.blocks.get(par_hash).expect("must have block").block_id();
+
+                blocks.insert((block, par_id));
             }
         }
 
         ChangeSet { blocks }
     }
 
-    /// Construct from [`ChangeSet`].
-    ///
-    /// Errors if changeset is empty, or does not contain a genesis block.
-    pub fn from_changeset(changeset: ChangeSet<T>) -> Result<Self, MissingGenesisError> {
-        let (genesis, _) = changeset
-            .blocks
-            .iter()
-            .find(|(b, _)| b.block_id().height == 0)
-            .cloned()
-            .ok_or(MissingGenesisError)?;
+    /// Apply update.
+    pub fn apply_update(&mut self, tip: List<T>) -> Result<ChangeSet<T>, CannotConnectError> {
+        let changeset = self.merge_chains(tip)?;
 
-        let mut graph = BlockGraph::from_genesis(genesis);
+        self.apply_changeset(&changeset);
 
-        for (block, par) in changeset.blocks {
-            let hash = block.block_id().hash;
-            if hash == graph.root {
-                continue;
-            }
-            // populate nodes
-            graph.blocks.insert(hash, Node::new(block, par));
-            // populate edges
-            graph.next_hashes.entry(par.hash).or_default().insert(hash);
-        }
+        debug_assert!(self.check_changeset_is_applied(&changeset));
 
-        // reindex
-        graph.reindex();
-
-        Ok(graph)
+        Ok(changeset)
     }
 
-    /// Returns the root node
-    fn genesis_node(&self) -> &Node<T> {
-        self.blocks.get(&self.root).expect("must have node")
-    }
-
-    /// Get the genesis hash
-    pub fn genesis_hash(&self) -> BlockHash {
-        self.root
-    }
-
-    /// Get block id by height
-    pub fn get(&self, height: u32) -> Option<BlockId> {
-        self.iter().map(|item| item.block_id()).find(|b| b.height == height)
-    }
-
-    /// Get a node in the graph by hash
-    pub fn node(&self, hash: &BlockHash) -> Option<&Node<T>> {
-        self.blocks.get(hash)
-    }
-
-    /// Get the chain tip block id
-    pub fn tip(&self) -> BlockId {
-        self.get_chain_tip().expect("infallible")
-    }
-
-    /// Iterate elements of `&T` in descending height order from the tip of the active chain.
-    pub fn iter(&self) -> impl Iterator<Item = &T> {
-        self.iter_blocks(&self.tip)
-    }
-
-    /// Iterate elements of `&T` in descending height order from the chain defined by
-    /// the given `hash`.
-    ///
-    /// This method returns an iterator that visits nodes of the graph beginning at
-    /// `hash` and each node of the parent chain which it extends.
-    ///
-    /// Note that the returned block items may or may not belong to the best chain.
-    pub fn iter_blocks(&self, hash: &BlockHash) -> impl Iterator<Item = &T> {
-        let mut cur = *hash;
-        core::iter::from_fn(move || {
-            let node = self.blocks.get(&cur)?;
-            let item = &node.data;
-            cur = node.connected_at().hash;
-            Some(item)
-        })
-    }
-
-    /// Reindex the block graph. This should be done whenever it's uncertain what the best chain is.
-    ///
-    /// If a new tip is found it returns the old tip, otherwise None.
-    pub fn reindex(&mut self) -> Option<BlockHash> {
-        let mut valid_tips = HashSet::new();
-
-        // Find the possible tips. A tip is any node from which no edge extends.
-        let possible_tips = self.blocks.keys().filter(|&hash| !self.next_hashes.contains_key(hash));
-
-        // Keep only the ones that make up a valid chain.
-        for &tip_hash in possible_tips {
-            if self.is_valid_chain(&tip_hash) {
-                println!("Valid chain {}", tip_hash);
-                valid_tips.insert(tip_hash);
+    /// Apply changeset.
+    fn apply_changeset(&mut self, changeset: &ChangeSet<T>) {
+        // Add blocks to graph.
+        for (block, par) in changeset.blocks.iter().cloned() {
+            let block_id = block.block_id();
+            let hash = block_id.hash;
+            self.blocks.insert(hash, block);
+            // Skip adding to `next_hashes` for the genesis block, since
+            // it doesn't extend from anything.
+            if block_id.height != 0 {
+                self.next_hashes.entry(par.hash).or_default().insert(hash);
             }
         }
-
-        self.tips = valid_tips;
-
-        // Of the valid tips pick the best one.
-        self.compare_tips()
+        // Update List index.
+        // TODO: it seems dangerous to unconditionally set the new tip. This works for now
+        // because `apply_changeset` is only called after successfully merging chains.
+        let tip = self.tip.clone();
+        let new_tip = apply_changeset_to_tip(tip, changeset);
+        self.tip = new_tip;
     }
 
-    /// Whether the chain of the given `hash` constitutes a valid chain.
+    /// Check changeset is applied, only used in debug mode.
     ///
-    /// The possible chain with tip `hash` is a valid chain if it connects to genesis
-    /// either directly or indirectly through one of its parents.
-    fn is_valid_chain(&self, hash: &BlockHash) -> bool {
-        let genesis_block = self.genesis_node().block_id();
-        let chain_tip = self.tip();
+    /// Note this function assumes that every element of `changeset` is also part of
+    /// the canonical chain, although normally that's not a requirement of ChangeSet.
+    fn check_changeset_is_applied(&self, changeset: &ChangeSet<T>) -> bool {
+        let mut cur = self.tip.clone();
+        for (block, par) in changeset.blocks.iter().rev() {
+            let block_id = block.block_id();
+            // The block is present in the block graph
+            if !self.blocks.contains_key(&block_id.hash) {
+                return false;
+            }
+            // The block extends from the parent
+            let empty_extends = HashSet::new();
+            let extends = self.next_hashes.get(&par.hash).unwrap_or(&empty_extends);
+            if !extends.contains(&block_id.hash) {
+                return false;
+            }
 
-        let mut visited = HashSet::new();
-        let mut to_validate = vec![*hash];
-
-        while let Some(hash) = to_validate.pop() {
-            if let Some(node) = self.blocks.get(&hash) {
-                // If a parent is found to be in the best chain, we can deduce
-                // that this is a valid chain.
-                if let Ok(Some(true)) = self.is_block_in_chain(node.block_id(), chain_tip) {
-                    println!("Found parent in main chain");
-                    return true;
+            // The block is in the canonical List
+            match cur.get(block_id.height) {
+                Some(ls) => {
+                    if &ls.value() != block {
+                        return false;
+                    }
+                    cur = ls;
                 }
-                // If validity can't be determined by the current tip then we iterate blocks of
-                // the chain we're considering and see if it ends at the genesis block.
-                if self.iter_blocks(&node.hash()).last().map(|item| item.block_id())
-                    == Some(genesis_block)
-                {
-                    println!("Found genesis");
-                    return true;
-                }
-                let ancestors =
-                    node.ancestors().map(|b| b.hash).filter(|&hash| visited.insert(hash));
-                to_validate.extend(ancestors);
+                None => return false,
             }
         }
-
-        false
-    }
-
-    /// Compare all tips of `self` and set the new best hash, returning the old tip if it changed.
-    ///
-    /// The best block is defined as the tip of the longest chain, or in case of a tie, the tip
-    /// with the smallest block hash, as it implies more work.
-    fn compare_tips(&mut self) -> Option<BlockHash> {
-        let best_block = self
-            .tips
-            .iter()
-            .flat_map(|hash| Some(self.blocks.get(hash)?.block_id()))
-            .max_by_key(|b| (b.height, cmp::Reverse(b.hash)))?;
-
-        // Update to the new best tip if necessary
-        if self.tip() != best_block {
-            println!("New tip {} {}", best_block.height, best_block.hash);
-            let old_tip = self.tip;
-            self.tip = best_block.hash;
-            return Some(old_tip);
-        }
-
-        println!("Compare tips resulted in no change");
-        None
+        true
     }
 }
 
-/// Error caused by lack of a genesis block
-#[derive(Debug)]
-pub struct MissingGenesisError;
-
-impl fmt::Display for MissingGenesisError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "block graph must have genesis node")
+impl<T: fmt::Debug + Clone + PartialEq> PartialEq for BlockGraph<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.blocks == other.blocks
+            && self.next_hashes == other.next_hashes
+            && self.root == other.root
+            && self.tip == other.tip
     }
 }
 
-impl std::error::Error for MissingGenesisError {}
-
-impl<T: ToBlockId + Ord + Clone> ChainOracle for BlockGraph<T> {
-    type Error = core::convert::Infallible;
-
-    fn get_chain_tip(&self) -> Result<BlockId, Self::Error> {
-        let hash = self.tip;
-        let height = self.blocks.get(&hash).expect("must have tip node").height();
-
-        Ok(BlockId { height, hash })
-    }
-
-    fn is_block_in_chain(
-        &self,
-        block: BlockId,
-        chain_tip: BlockId,
-    ) -> Result<Option<bool>, Self::Error> {
-        // The block cannot be in chain if its height is not within `chain_tip`
-        if block.height > chain_tip.height {
-            return Ok(None);
-        }
-        // We can't determine if block is in chain if `chain_tip` is
-        // not part of the best chain
-        if self.get(chain_tip.height) != Some(chain_tip) {
-            return Ok(None);
-        }
-        // If `block` is reachable from the tip and the hashes match, then it
-        // is also part of the best chain.
-        Ok(self.get(block.height).map(|b| b.hash == block.hash))
-    }
-}
-
-/// Records changes and additions to the block graph
-#[derive(Debug, Clone)]
+/// Change set.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(
     feature = "serde",
     derive(serde::Deserialize, serde::Serialize),
@@ -478,8 +229,8 @@ impl<T: ToBlockId + Ord + Clone> ChainOracle for BlockGraph<T> {
     ))
 )]
 pub struct ChangeSet<T> {
-    /// tuples of (block, parent)
-    blocks: BTreeSet<(T, BlockId)>,
+    /// Set of `(block, parent_id)`.
+    pub blocks: BTreeSet<(T, BlockId)>,
 }
 
 impl<T> Default for ChangeSet<T> {
@@ -490,7 +241,7 @@ impl<T> Default for ChangeSet<T> {
     }
 }
 
-impl<T: Ord> Merge for ChangeSet<T> {
+impl<T: Default + Ord> Merge for ChangeSet<T> {
     fn merge(&mut self, other: Self) {
         self.blocks.extend(other.blocks);
     }
@@ -499,89 +250,197 @@ impl<T: Ord> Merge for ChangeSet<T> {
     }
 }
 
+/// Apply changeset to tip.
+fn apply_changeset_to_tip<T>(mut tip: List<T>, changeset: &ChangeSet<T>) -> List<T>
+where
+    T: ToBlockId + fmt::Debug + Ord + Clone,
+{
+    if let Some((start_block, _)) = changeset.blocks.iter().next() {
+        let start_height = start_block.block_id().height;
+
+        let mut extension = BTreeMap::<u32, T>::new();
+        let mut base = None;
+
+        // Keep blocks of the existing chain that are above the start height.
+        for cur in tip.iter() {
+            if cur.height() < start_height {
+                base = Some(cur);
+                break;
+            }
+            extension.insert(cur.height(), cur.value());
+        }
+
+        for (block, _) in &changeset.blocks {
+            let height = block.block_id().height;
+            extension.insert(height, block.clone());
+        }
+
+        let new_tip = match base {
+            Some(ls) => ls.extend(extension).expect("extension is strictly greater than base"),
+            None => List::from_entries(extension).expect("valid List"),
+        };
+
+        debug_assert_eq!(new_tip.iter().last(), tip.get(0), "new tip must be a valid chain");
+
+        tip = new_tip;
+    }
+
+    tip
+}
+
+impl<T> BlockGraph<T>
+where
+    T: ToBlockId + fmt::Debug + Ord + Clone,
+{
+    /// Merges `update` with `self` and returns the resulting [`ChangeSet`].
+    ///
+    /// Returns a [`CannotConnectError`] if the chains don't connect.
+    fn merge_chains(&mut self, update: List<T>) -> Result<ChangeSet<T>, CannotConnectError> {
+        // The changes to be applied if merging the chains succeeds.
+        let mut stage: BTreeSet<(T, Option<BlockId>)> = BTreeSet::new();
+
+        let mut orig = self.tip.iter();
+        let mut update = update.iter();
+        let mut curr_orig: Option<List<T>> = None;
+        let mut curr_update: Option<List<T>> = None;
+        let mut prev_orig: Option<List<T>> = None;
+        let mut prev_update: Option<List<T>> = None;
+        let mut point_of_agreement_found = false;
+        let mut prev_orig_was_invalidated = false;
+
+        let mut potentially_invalidated_heights = vec![];
+
+        // If we can, we want to return the update tip as the new tip because this allows checkpoints
+        // in multiple locations to keep the same `Arc` pointers when they are being updated from each
+        // other using this function. We can do this as long as the update contains every
+        // block's height of the original chain.
+        // let mut is_update_height_superset_of_original = true;
+
+        // To find the difference between the new chain and the original we iterate over both of them
+        // from the tip backwards in tandem. We are always dealing with the highest one from either chain
+        // first and move to the next highest. The crucial logic is applied when they have blocks at the
+        // same height.
+        loop {
+            if curr_orig.is_none() {
+                curr_orig = orig.next();
+            }
+            if curr_update.is_none() {
+                curr_update = update.next();
+            }
+
+            match (curr_orig.as_ref(), curr_update.as_ref()) {
+                // Update block that doesn't exist in the original chain
+                (orig, Some(update)) if Some(update.height()) > orig.map(|o| o.height()) => {
+                    stage.insert((update.value(), update.prev().map(|l| l.value().block_id())));
+                    prev_update = curr_update.take();
+                }
+                // Original block that isn't in the update
+                (Some(orig), update) if Some(orig.height()) > update.map(|u| u.height()) => {
+                    // this block might be gone if an earlier block gets invalidated
+                    potentially_invalidated_heights.push(orig.height());
+                    prev_orig_was_invalidated = false;
+                    prev_orig = curr_orig.take();
+
+                    // is_update_height_superset_of_original = false;
+
+                    // OPTIMIZATION: we have run out of update blocks so we don't need to continue
+                    // iterating because there's no possibility of adding anything to changeset.
+                    if update.is_none() {
+                        break;
+                    }
+                }
+                (Some(orig), Some(update)) => {
+                    if orig.value().block_id().hash == update.value().block_id().hash {
+                        // We found the connection point. We require that the previous (i.e.
+                        // higher because we are iterating backwards) block in the original chain was
+                        // invalidated (if it exists). This ensures that there is an unambiguous point of
+                        // connection to the original chain from the update chain (i.e. we know the
+                        // precisely which original blocks are invalid).
+                        if !prev_orig_was_invalidated && !point_of_agreement_found {
+                            if let (Some(prev_orig), Some(_prev_update)) =
+                                (&prev_orig, &prev_update)
+                            {
+                                return Err(CannotConnectError(prev_orig.height()));
+                            }
+                        }
+                        point_of_agreement_found = true;
+                        prev_orig_was_invalidated = false;
+                        // OPTIMIZATION 2 -- if we have the same underlying pointer at this point, we
+                        // can guarantee that no older blocks are introduced.
+                        if Arc::as_ptr(&orig.0) == Arc::as_ptr(&update.0) {
+                            break;
+                        }
+                    } else {
+                        // We have an invalidation height so we set the height to the updated hash and
+                        // also purge all the original chain block hashes above this block.
+                        stage.insert((update.value(), update.prev().map(|l| l.value().block_id())));
+                        prev_orig_was_invalidated = true;
+                    }
+                    prev_update = curr_update.take();
+                    prev_orig = curr_orig.take();
+                }
+                (None, None) => {
+                    break;
+                }
+                _ => {
+                    unreachable!("compiler cannot tell that everything has been covered")
+                }
+            }
+        }
+
+        // When we don't have a point of agreement you can imagine it is implicitly the
+        // genesis block so we need to do the final connectivity check which in this case
+        // just means making sure the entire original chain was invalidated.
+        if !prev_orig_was_invalidated && !point_of_agreement_found {
+            if let Some(prev_orig) = prev_orig {
+                return Err(CannotConnectError(prev_orig.height()));
+            }
+        }
+
+        let blocks = stage
+            .into_iter()
+            // We don't apply changes to the genesis block.
+            .filter(|(block, _)| block.block_id().height > 0)
+            .map(|(block, mut par)| {
+                // Find a suitable parent if needed.
+                if par.is_none() {
+                    let height = block.block_id().height;
+                    let ls = self.tip.range(..height).next();
+                    par = ls.map(|l| l.value().block_id());
+                }
+
+                (block, par.expect("Every non-root Node has a parent"))
+            })
+            .collect();
+
+        Ok(ChangeSet { blocks })
+    }
+}
+
+/// Happens when the chain being merged doesn't connect to the parent chain.
+///
+/// Includes the height of the parent chain that refused the connection.
+#[derive(Debug)]
+pub struct CannotConnectError(pub u32);
+
+impl fmt::Display for CannotConnectError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Cannot connect; try include height: {}", self.0)
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for CannotConnectError {}
+
 #[cfg(test)]
 mod test {
     use super::*;
 
-    use bitcoin::Target;
-    use bitcoin::{block, consensus, hashes};
-
-    /// Generate a Header with a unique nonce `n` and constant difficulty
-    fn generate_header(prev_blockhash: BlockHash, n: u32) -> Header {
-        Header {
-            version: block::Version::default(),
-            prev_blockhash,
-            merkle_root: hashes::Hash::hash(b"merkle-root"),
-            time: 123,
-            bits: Target::MAX_ATTAINABLE_REGTEST.to_compact_lossy(),
-            nonce: n,
-        }
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-    struct SimpleHeader {
-        height: u32,
-        hash: BlockHash,
-        prev_hash: BlockHash,
-    }
-
-    impl ToBlockId for SimpleHeader {
-        fn block_id(&self) -> BlockId {
-            BlockId {
-                height: self.height,
-                hash: self.hash,
-            }
-        }
-    }
-
-    impl SimpleHeader {
-        fn genesis() -> Self {
-            Self {
-                height: 0,
-                hash: bitcoin::constants::genesis_block(Network::Regtest).block_hash(),
-                prev_hash: BlockHash::all_zeros(),
-            }
-        }
-
-        fn new(height: u32, header: Header) -> Self {
-            Self {
-                height,
-                hash: header.block_hash(),
-                prev_hash: header.prev_blockhash,
-            }
-        }
-    }
+    use crate::BlockHeaderId;
+    use bitcoin::{constants, Network};
 
     #[test]
-    fn header_chain() {
-        let mut prev_hash = BlockHash::all_zeros();
-
-        let mut headers = vec![];
-
-        for height in 0u32..5 {
-            let hash: BlockHash = bitcoin::hashes::Hash::hash(height.to_be_bytes().as_slice());
-            let header = SimpleHeader {
-                height,
-                hash,
-                prev_hash,
-            };
-            headers.push(header);
-            // update prev hash
-            prev_hash = hash;
-        }
-
-        let g = headers[0];
-        let mut graph = BlockGraph::from_genesis(g);
-        for header in headers.into_iter().skip(1) {
-            let cs = graph.connect_block(header, graph.tip());
-            assert!(!cs.blocks.is_empty());
-        }
-        // dbg!(&graph);
-        assert_eq!(graph.blocks.len(), 5);
-    }
-
-    #[test]
-    fn from_genesis() {
+    fn test_from_genesis() {
         let genesis_block = constants::genesis_block(Network::Bitcoin);
         let header = genesis_block.header;
         let hash = genesis_block.block_hash();
@@ -592,386 +451,82 @@ mod test {
         };
         let graph = BlockGraph::from_genesis(header);
         assert_eq!(graph.blocks.len(), 1);
-        assert_eq!(graph.tips.len(), 1);
+        assert!(graph.next_hashes.is_empty());
+        assert_eq!(graph.tip.iter().count(), 1);
     }
 
     #[test]
-    fn connect_block() {
-        let genesis_block = constants::genesis_block(Network::Signet);
-        let header = genesis_block.header;
-        let hash = genesis_block.block_hash();
-        let header = BlockHeaderId {
-            height: 0,
-            hash,
-            header,
-        };
-        let mut graph = BlockGraph::from_genesis(header);
-
-        let header_1: Header = consensus::encode::deserialize_hex("00000020f61eee3b63a380a477a063af32b2bbc97c9ff9f01f2c4225e973988108000000f575c83235984e7dc4afc1f30944c170462e84437ab6f2d52e16878a79e4678bd1914d5fae77031eccf40700")
-            .unwrap();
-        let header_1 = BlockHeaderId {
-            height: 1,
-            hash: header_1.block_hash(),
-            header: header_1,
-        };
-        let tip = graph.tip();
-        let cs = graph.connect_block(header_1, tip);
-        assert!(!cs.blocks.is_empty());
-        // dbg!(&res);
-        // dbg!(&graph);
-        assert_eq!(graph.blocks.len(), 2);
-        assert_eq!(graph.tip().height, header_1.height);
-        assert_eq!(graph.tip().hash, header_1.hash);
-    }
-
-    #[test]
-    fn graph_should_handle_connecting_same_block() {
-        let mut graph = BlockGraph::from_genesis(SimpleHeader::genesis());
-        let genesis_header = graph.genesis_node().data;
-        let og_tip = graph.tip();
-
-        // try reconnect the genesis block
-        let cs = graph.connect_block(genesis_header, og_tip);
-        assert!(cs.blocks.is_empty());
-
-        // connect block 1 for real
-        let header = generate_header(og_tip.hash, 1);
-        let header_1 = SimpleHeader {
-            height: 1,
-            hash: header.block_hash(),
-            prev_hash: og_tip.hash,
-        };
-        let cs = graph.connect_block(header_1, og_tip);
-        assert!(!cs.blocks.is_empty());
-        assert_eq!(graph.tip().height, 1);
-
-        // attempting to reconnect the genesis block should not
-        // add edges superfluously
-        let genesis_par = graph.node(&og_tip.hash).unwrap().connected_at();
-        assert_eq!(genesis_par.hash, BlockHash::all_zeros());
-        let cs = graph.connect_block(genesis_header, genesis_par);
-        assert!(cs.blocks.is_empty());
-
-        // Now reconnect the same header to the original tip
-        let cs = graph.connect_block(header_1, og_tip);
-        assert!(cs.blocks.is_empty());
-
-        // connect the current tip to itself
-        let tip = graph.tip();
-        let node = graph.node(&tip.hash).unwrap().clone();
-        let cs = graph.connect_block(node.data, tip);
-        assert!(cs.blocks.is_empty());
-    }
-
-    #[test]
-    fn iter_timechain() {
-        let mut prev_hash = BlockHash::all_zeros();
-
-        let mut headers: Vec<SimpleHeader> = vec![];
-
-        for height in 0u32..5 {
-            let hash: BlockHash = hashes::Hash::hash(height.to_be_bytes().as_slice());
-            let header = SimpleHeader {
-                height,
-                hash,
-                prev_hash,
-            };
-            headers.push(header);
-            // update prev hash
-            prev_hash = hash;
-        }
-
-        let g = headers[0];
-        let mut graph = BlockGraph::from_genesis(g);
-        for header in headers.into_iter().skip(1) {
-            let _ = graph.connect_block(header, graph.tip());
-        }
-        // dbg!(&graph);
-        assert_eq!(graph.blocks.len(), 5);
-
-        let blocks: Vec<SimpleHeader> = graph.iter().copied().collect();
-        assert_eq!(blocks.len(), 5);
-    }
-
-    #[test]
-    fn update_best_chain() {
-        let mut graph = BlockGraph::from_genesis(SimpleHeader::genesis());
-        let og_tip = graph.tip();
-
-        // connect block 1
-        let header = generate_header(og_tip.hash, 1);
-        let header_1 = SimpleHeader::new(1, header);
-        let _ = graph.connect_block(header_1, og_tip);
-        assert_eq!(graph.tip().height, 1);
-        let og_tip_1 = graph.tip();
-
-        // connect fork tip block 1h
-        let mut header_h = header;
-        header_h.nonce = 2;
-        let header_1h = SimpleHeader::new(1, header_h);
-        assert_ne!(header_1h, header_1);
-        let _ = graph.connect_block(header_1h, og_tip);
-        assert_eq!(graph.blocks.len(), 3);
-        assert_eq!(graph.tips.len(), 2);
-        // no reorg yet
-        assert_eq!(graph.tip(), og_tip_1);
-
-        // now build on top of the fork tip
-        let header = generate_header(header_1h.hash, 2);
-        let header_2h = SimpleHeader::new(2, header);
-        let header_1h_block = BlockId {
-            height: header_1h.height,
-            hash: header_1h.hash,
-        };
-        let _ = graph.connect_block(header_2h, header_1h_block);
-        assert_eq!(graph.tip().height, 2);
-        assert_eq!(graph.tip(), header_2h.block_id());
-        // dbg!(&graph);
-    }
-
-    #[test]
-    fn connect_orphan_block() {
-        let genesis_header = SimpleHeader::genesis();
-        let mut graph = BlockGraph::from_genesis(genesis_header);
-
-        let mut prev_hash = graph.genesis_node().hash();
-
-        for n in 0..3 {
-            let header = generate_header(prev_hash, n);
-            let hash = header.block_hash();
-            // connect this block
-            let height = n + 1;
-            let to_connect = SimpleHeader::new(height, header);
-            let _ = graph.connect_block(to_connect, graph.tip());
-            // update previous hash
-            prev_hash = hash;
-        }
-
-        assert_eq!(graph.blocks.len(), 4);
-        assert_eq!(graph.tips.len(), 1);
-        let og_tip = graph.tip();
-
-        // Now connect an orphan, i.e. a block with no in-graph parents
-        let conn = BlockId {
-            height: 2,
-            hash: hashes::Hash::hash(b"no-parent"),
-        };
-        let header = generate_header(conn.hash, 42);
-        let header_3a = SimpleHeader::new(3, header);
-        let _ = graph.connect_block(header_3a, conn);
-        // dbg!(&graph.tips);
-        assert_eq!(graph.blocks.len(), 5);
-        assert_eq!(graph.tips.len(), 1, "we should not have added any new tips");
-        assert_eq!(graph.tip(), og_tip);
-    }
-
-    #[test]
-    fn test_reindex() {
-        // case: test tiebreak for best chain by block hash
-        let blocks: Vec<BlockId> = [
-            (0, "b90ca5b5653eabdc3341c6f96b3b80689cdd1bd6870265adfe17c8172501b98c"),
-            (1, "73654ed17dba11dfe673300a31f9b4602ba735f4cce897ad9d719c965184b8fc"),
-            (2, "b4f6ae6edf5a32fb6d9322563bde4b760472849556e78cac335ba711f33c173d"),
-            (3, "020ee6a7037876579694f33ae98a6d2936213a557c0d8adae77a30ed6f4f0687"),
-            (4, "5f19f2d6af102537e6db3d4e87dc4b8ebc4770c984d1f924e62450727f73bd89"),
-        ]
-        .into_iter()
-        .map(|(height, s)| {
-            let hash = s.parse().unwrap();
-            BlockId { height, hash }
-        })
-        .collect();
-
-        let genesis = blocks[0];
-        let mut graph = BlockGraph::from_genesis(genesis);
-
-        for i in (0..3).skip(1) {
-            let block = blocks[i];
-            let _ = graph.connect_block(block, graph.tip());
-        }
-
-        assert_eq!(graph.blocks.len(), 3);
-        assert_eq!(graph.tip().height, 2);
-
-        // now introduce a fork contender block_2a with a "smaller" hash
-        let block_1 = graph.get(1).unwrap();
-        let block_2 = graph.get(2).unwrap();
-        let mut block_2a = block_2;
-        block_2a.hash = "a4f6ae6edf5a32fb6d9322563bde4b760472849556e78cac335ba711f33c173d"
-            .parse()
-            .unwrap();
-        assert!(block_2a.hash < block_2.hash);
-
-        let cs = graph.connect_block(block_2a, block_1);
-        assert!(!cs.is_empty(), "block_2a should connect");
-
-        // reindex
-        graph.tip = genesis.hash;
-        graph.tips.clear();
-
-        graph.reindex();
-
-        assert_eq!(graph.tip(), block_2a);
-
-        // case: test remove valid tips and recover them
-        let mut graph = BlockGraph::from_genesis(genesis);
-        for i in (0..5).skip(1) {
-            let block = blocks[i];
-            let _ = graph.connect_block(block, graph.tip());
-        }
-
-        assert_eq!(graph.tip().height, 4);
-        let exp_tip = graph.tip();
-
-        // reindex
-        graph.tip = genesis.hash;
-        graph.tips.clear();
-
-        graph.reindex();
-
-        assert_eq!(graph.tip(), exp_tip);
-    }
-
-    #[test]
-    fn test_is_valid_chain() {
-        // create a graph with 3 distinct but valid chains
-        let root = "5f19f2d6af102537e6db3d4e87dc4b8ebc4770c984d1f924e62450727f73bd89"
-            .parse()
-            .unwrap();
+    fn test_apply_update() {
         let genesis_block = BlockId {
             height: 0,
-            hash: root,
+            hash: Hash::hash(b"gen"),
         };
-        let heights = [1, 2, 3];
-        let hashes: Vec<BlockHash> = vec![
-            "4d08b5fa27745754a02dbc3cf4cb348223bc543d7f75e36ffbcfb9dda9919715"
-                .parse()
-                .unwrap(),
-            "2b97e32191a25284730c814ca77f3055df9670301b1fcc1e5ddb4c4efea7087a"
-                .parse()
-                .unwrap(),
-            "1e64eb10b47460346bebac7d8a23db82f470fd53c3f61a6daa4b2e5df52e6508"
-                .parse()
-                .unwrap(),
-        ];
         let mut graph = BlockGraph::from_genesis(genesis_block);
-        for (&height, &hash) in heights.iter().zip(&hashes) {
-            let block = BlockId { height, hash };
-            let _ = graph.connect_block(block, graph.tip());
-        }
-        assert_eq!(graph.tip().height, 3);
 
-        // insert blocks of a new chain also with tip height 3
-        let hashes: Vec<BlockHash> = vec![
-            "5b05130a385e58e6192af1c5abdf79abe782ae784783476336483cfa67c1aaf3"
-                .parse()
-                .unwrap(),
-            "1c3b0be0aba92d5345faec0c07b70a0261bbb1a6532eee76ea81d32483bfa7e4"
-                .parse()
-                .unwrap(),
-            "345241109d2e0b3be9e61ef017bfb9ca939e53994129e91f58a2e0d367578c77"
-                .parse()
-                .unwrap(),
-        ];
-        for (&height, &hash) in heights.iter().zip(&hashes) {
-            let block = BlockId { height, hash };
-            let par = if height == 1 {
-                genesis_block
-            } else {
-                BlockId {
-                    height: height - 1,
-                    hash: hashes[(height - 2) as usize],
-                }
-            };
-            let _ = graph.connect_block(block, par);
-        }
-        assert_eq!(graph.tip().height, 3);
-        assert_eq!(graph.tips.len(), 2);
-        assert_eq!(graph.blocks.len(), 7);
-
-        // repeat again for a total of 10 blocks
-        let hashes: Vec<BlockHash> = vec![
-            "055445553b85fca3ee9632fa0a9e90d582789fdcb88ef9486d8ed29b2d3302ca"
-                .parse()
-                .unwrap(),
-            "78a18b4420f09c8e1aa312f7d40721c579d3b8c28da12ded5a6c00f249915f07"
-                .parse()
-                .unwrap(),
-            "162b270c510de742033b83ab5bc50e509f2064ae24f74d9845827438f1096ed9"
-                .parse()
-                .unwrap(),
-        ];
-        for (&height, &hash) in heights.iter().zip(&hashes) {
-            let block = BlockId { height, hash };
-            let par = if height == 1 {
-                genesis_block
-            } else {
-                BlockId {
-                    height: height - 1,
-                    hash: hashes[(height - 2) as usize],
-                }
-            };
-            let _ = graph.connect_block(block, par);
-        }
-        assert_eq!(graph.blocks.len(), 10);
-
-        // we should have three unique tips
-        assert_eq!(graph.tips.len(), 3);
-        // height of tip is unchanged
-        assert_eq!(graph.tip().height, 3);
-        // smallest of the tips from above
-        assert_eq!(
-            graph.tip.to_string(),
-            "1e64eb10b47460346bebac7d8a23db82f470fd53c3f61a6daa4b2e5df52e6508"
-        );
-
-        // now extend the best chain
-        let hash = "230972c4e5148d7b6ca2f2be745896e89ca5e9b66b876bf519e6030fb9cc0e36"
-            .parse()
-            .unwrap();
-        let block_4 = BlockId { height: 4, hash };
-        let _ = graph.connect_block(block_4, graph.tip());
-        assert_eq!(graph.tip().height, 4);
-
-        // reindex
-        graph.tip = genesis_block.hash;
-        graph.tips.clear();
-
-        // should recover original tips
-        graph.reindex();
-
-        assert_eq!(graph.tips.len(), 3);
-        assert_eq!(graph.tip(), block_4);
-    }
-
-    #[test]
-    fn test_from_changeset() {
-        const BLOCK_CT: usize = 5;
-
-        let genesis = BlockId {
-            height: 0,
-            hash: constants::genesis_block(Network::Regtest).block_hash(),
-        };
-        let mut graph = BlockGraph::from_genesis(genesis);
-
-        for i in 0..BLOCK_CT {
-            let height = i as u32 + 1;
-
+        let mut ls = graph.tip.clone();
+        for height in 1..=3 {
             let block = BlockId {
                 height,
                 hash: Hash::hash(height.to_be_bytes().as_slice()),
             };
-            let _ = graph.connect_block(block, graph.tip());
+            ls = ls.push(height, block).unwrap();
         }
 
-        assert_eq!(graph.blocks.len(), (BLOCK_CT + 1));
+        let cs = graph.apply_update(ls).unwrap();
+        assert_eq!(cs.blocks.len(), 3);
+    }
 
-        let changeset = graph.initial_changeset();
-        assert_eq!(changeset.blocks.len(), (BLOCK_CT + 1));
+    #[test]
+    fn iter_timechain() {
+        let genesis_block = BlockId {
+            height: 0,
+            hash: Hash::hash(b"gen"),
+        };
+        let mut graph = BlockGraph::from_genesis(genesis_block);
+
+        let mut blocks: Vec<BlockId> = vec![genesis_block];
+
+        let mut ls = graph.tip.clone();
+        for height in 1..=3 {
+            let block = BlockId {
+                height,
+                hash: Hash::hash(height.to_be_bytes().as_slice()),
+            };
+            ls = ls.push(height, block).unwrap();
+            blocks.push(block);
+        }
+        let _ = graph.apply_update(ls).unwrap();
+
+        blocks.reverse();
+        let tip_blocks = graph.tip.iter().map(|l| l.value()).collect::<Vec<_>>();
+        assert_eq!(tip_blocks, blocks);
+    }
+
+    #[test]
+    fn test_initial_changeset() {
+        let genesis_block = BlockId {
+            height: 0,
+            hash: Hash::hash(b"gen"),
+        };
+        let mut graph = BlockGraph::from_genesis(genesis_block);
+
+        let mut ls = graph.tip.clone();
+        for height in 1..=3 {
+            let block = BlockId {
+                height,
+                hash: Hash::hash(height.to_be_bytes().as_slice()),
+            };
+            ls = ls.push(height, block).unwrap();
+        }
+
+        let _ = graph.apply_update(ls).unwrap();
+
+        // obtain the initial changeset
+        let cs = graph.initial_changeset();
+        assert_eq!(cs.blocks.len(), 4);
 
         // now recover from changeset
-        let recovered =
-            BlockGraph::from_changeset(changeset).expect("should construct from changeset");
+        let recovered = BlockGraph::from_changeset(cs).unwrap().unwrap();
         assert_eq!(recovered, graph);
     }
 }
