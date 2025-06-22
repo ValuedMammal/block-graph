@@ -110,7 +110,72 @@ impl<T: ToBlockId + fmt::Debug + Ord + Clone> BlockGraph<T> {
         }
 
         let mut graph = Self::from_genesis(genesis);
-        graph.apply_changeset(&changeset);
+
+        // Keep a map of block_id -> prev_hash
+        let prev_hashes = changeset
+            .blocks
+            .iter()
+            .map(|(b, par)| (b.block_id(), par.hash))
+            .collect::<HashMap<_, _>>();
+
+        // The following algorithm is meant to deterministically find the tip of
+        // the longest chain among a set of possible tips.
+        
+        // First fill in block nodes and next hashes
+        for (block, par) in changeset.blocks {
+            let block_id = block.block_id();
+            let hash = block_id.hash;
+            graph.blocks.insert(hash, block);
+            // Skip adding to `next_hashes` for the genesis block, since
+            // it doesn't extend from anything.
+            if block_id.height != 0 {
+                graph.next_hashes.entry(par.hash).or_default().insert(hash);
+            }
+        }
+
+        // Find the possible tips by exploring `.next_hashes` depth-first starting from the root.
+        let mut tips = HashSet::<BlockHash>::new();
+        let mut queue = vec![genesis_block.hash];
+
+        while let Some(hash) = queue.pop() {
+            match graph.next_hashes.get(&hash) {
+                Some(next_hashes) => {
+                    queue.extend(next_hashes);
+                }
+                None => {
+                    // This is a candidate tip.
+                    tips.insert(hash);
+                }
+            }
+        }
+
+        // Find the longest chain. If there's a tie, use the smaller of the two
+        // block hashes, as it implies more work.
+        let tip = tips
+            .iter()
+            .flat_map(|hash| Some(graph.blocks.get(hash)?.block_id()))
+            .max_by_key(|b| (b.height, core::cmp::Reverse(b.hash)))
+            .expect("should find tip");
+
+        // Now that we know the tip we need to traverse back to the root,
+        // collecting elements of T along the way.
+
+        let mut cur = graph.blocks.get(&tip.hash);
+        let mut blocks = vec![];
+
+        while let Some(block) = cur {
+            blocks.push(block.clone());
+            let prev = prev_hashes.get(&block.block_id()).copied().unwrap();
+            cur = graph.blocks.get(&prev);
+        }
+
+        // Finally, construct the canonical list.
+        let mut tip = graph.tip.clone();
+        for block in blocks.into_iter().rev() {
+            let height = block.block_id().height;
+            tip = tip.insert(height, block);
+        }
+        graph.tip = tip;
 
         Ok(Some(graph))
     }
@@ -168,8 +233,6 @@ impl<T: ToBlockId + fmt::Debug + Ord + Clone> BlockGraph<T> {
             }
         }
         // Update List index.
-        // TODO: it seems dangerous to unconditionally set the new tip. This works for now
-        // because `apply_changeset` is only called after successfully merging chains.
         let tip = self.tip.clone();
         let new_tip = apply_changeset_to_tip(tip, changeset);
         self.tip = new_tip;
