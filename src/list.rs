@@ -1,8 +1,14 @@
 //! [`List`] is a cheaply cloneable, singly-linked list.
 
-use std::fmt;
-use std::ops::RangeBounds;
-use std::sync::Arc;
+use alloc::sync::Arc;
+use alloc::vec;
+use core::fmt;
+use core::ops::RangeBounds;
+
+use bdk_chain::bitcoin::BlockHash;
+use bdk_chain::BlockId;
+
+use crate::ToBlockId;
 
 /// List, guaranteed to have at least 1 element.
 #[derive(Debug)]
@@ -30,7 +36,7 @@ impl<T: fmt::Debug> List<T> {
         Ok(ls.extend(entries)?)
     }
 
-    /// Extend with an iterator of (height, value) pairs.
+    /// Extend with an iterator of (height, value) entries.
     pub fn extend<I>(self, items: I) -> Result<Self, Self>
     where
         I: IntoIterator<Item = (u32, T)>,
@@ -108,6 +114,11 @@ impl<T: fmt::Debug> List<T> {
         self.0.value.clone()
     }
 
+    /// Whether `self` and `other` share the same underlying pointer.
+    pub fn eq_ptr(&self, other: &Self) -> bool {
+        Arc::as_ptr(&self.0) == Arc::as_ptr(&other.0)
+    }
+
     /// Iter.
     pub fn iter(&self) -> ListIter<T> {
         ListIter {
@@ -152,6 +163,18 @@ impl<T: fmt::Debug + Clone + PartialEq> PartialEq for List<T> {
     }
 }
 
+impl<T: ToBlockId + fmt::Debug + Clone> List<T> {
+    /// Return the block id of this list node.
+    pub fn block_id(&self) -> BlockId {
+        self.value().block_id()
+    }
+
+    /// Return the block hash of this list node.
+    pub fn hash(&self) -> BlockHash {
+        self.block_id().hash
+    }
+}
+
 /// Node containing both a key and value. The key is referred to as `height`.
 #[derive(Debug)]
 pub(crate) struct Node<T> {
@@ -160,7 +183,9 @@ pub(crate) struct Node<T> {
     pub prev: Option<Arc<Node<T>>>,
 }
 
-// We do this to avoid recursively dropping `Arc`s.
+// We do this to avoid recursively dropping `Arc`s,
+// which can happen whenever a `List` object goes out of scope
+// and the default destructor for `Node` is run.
 impl<T> Drop for Node<T> {
     fn drop(&mut self) {
         let mut cur = self.prev.take();

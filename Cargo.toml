@@ -13,3 +13,6 @@ serde = { version = "1", default-features = false, features = ["derive"], option
 default = ["std", "serde"]
 std = ["bdk_chain/std"]
 serde = ["dep:serde", "bdk_chain/serde"]
+
+[dev-dependencies.block-graph]
+path = "."
