@@ -1,0 +1,27 @@
+[package]
+name = "skiplist"
+version = "0.1.0"
+edition = "2021"
+readme = "README.md"
+rust-version = "1.63.0"
+
+[dependencies]
+rand = "0.8"
+
+[dev-dependencies]
+# LagginTimes:generic_checkpoint
+bdk_chain = { git = "https://github.com/LagginTimes/bdk", rev = "dabb869f77b6cb548e4a82c15b250df460695b24" }
+# bdk_chain = { path = "../../bdk/crates/chain" }
+criterion = { version = "0.2" }
+
+[[bench]]
+name = "skiplist"
+harness = false
+
+[[bench]]
+name = "skiplist_range"
+harness = false
+
+[[bench]]
+name = "checkpoint"
+harness = false

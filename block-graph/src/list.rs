@@ -5,11 +5,6 @@ use alloc::vec;
 use core::fmt;
 use core::ops::RangeBounds;
 
-use bdk_chain::bitcoin::BlockHash;
-use bdk_chain::BlockId;
-
-use crate::ToBlockId;
-
 /// List, guaranteed to have at least 1 element.
 #[derive(Debug)]
 pub struct List<T>(pub(crate) Arc<Node<T>>);
@@ -160,18 +155,6 @@ impl<T: fmt::Debug + Clone + PartialEq> PartialEq for List<T> {
         let a = self.iter().map(|l| (l.height(), l.value()));
         let b = other.iter().map(|l| (l.height(), l.value()));
         a.eq(b)
-    }
-}
-
-impl<T: ToBlockId + fmt::Debug + Clone> List<T> {
-    /// Return the block id of this list node.
-    pub fn block_id(&self) -> BlockId {
-        self.value().block_id()
-    }
-
-    /// Return the block hash of this list node.
-    pub fn hash(&self) -> BlockHash {
-        self.block_id().hash
     }
 }
 

@@ -1,4 +1,4 @@
-//! `block-graph`
+//! `block_graph`
 
 #![warn(missing_docs)]
 #![no_std]
@@ -9,11 +9,11 @@ extern crate alloc;
 #[macro_use]
 extern crate std;
 
-mod block_graph;
+#[allow(unused)]
 mod list;
 
+mod block_graph;
 pub use block_graph::*;
-pub use list::*;
 
 #[cfg(feature = "std")]
 pub(crate) mod collections {

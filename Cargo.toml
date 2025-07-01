@@ -1,18 +1,6 @@
-[package]
-name = "block-graph"
-version = "0.1.0"
-edition = "2021"
-rust-version = "1.63.0"
-readme = "README.md"
-
-[dependencies]
-bdk_chain = { version = "0.22.0", default-features = false }
-serde = { version = "1", default-features = false, features = ["derive"], optional = true }
-
-[features]
-default = ["std", "serde"]
-std = ["bdk_chain/std"]
-serde = ["dep:serde", "bdk_chain/serde"]
-
-[dev-dependencies.block-graph]
-path = "."
+[workspace]
+resolver = "2"
+members = [
+    "block-graph",
+    "skiplist",
+]

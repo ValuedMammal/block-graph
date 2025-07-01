@@ -1,0 +1,28 @@
+[package]
+name = "block_graph"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.63.0"
+readme = "README.md"
+
+[dependencies]
+# LagginTimes:generic_checkpoint
+bdk_chain = { git = "https://github.com/LagginTimes/bdk", rev = "dabb869f77b6cb548e4a82c15b250df460695b24" }
+# bdk_chain = { path = "../../bdk/crates/chain", default-features = false }
+serde = { version = "1", default-features = false, features = ["derive"], optional = true }
+skiplist = { path = "../skiplist", version = "0.1.0" }
+
+[features]
+default = ["std", "serde"]
+std = ["bdk_chain/std"]
+serde = ["dep:serde", "bdk_chain/serde"]
+
+[dev-dependencies.block_graph]
+path = "."
+
+[dev-dependencies]
+criterion = "0.2"
+
+[[bench]]
+name = "from_changeset"
+harness = false

@@ -7,7 +7,7 @@ alias f := fmt
 alias t := test
 
 check:
-    cargo check --all-targets --all-features
+    cargo check --workspace --all-targets --all-features
     cargo +nightly fmt --all -- --check
     cargo clippy --all-targets --all-features -- -Dwarnings
 
@@ -15,7 +15,7 @@ fmt:
     cargo +nightly fmt
 
 build:
-    cargo build
+    cargo build --workspace
 
 test:
-    cargo test --all-targets --all-features
+    cargo test --workspace --all-features -- --test-threads=1
