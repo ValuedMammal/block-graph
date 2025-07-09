@@ -31,7 +31,8 @@ fn from_changeset(c: &mut Criterion) {
     for i in 0..CT {
         let height = i as u32;
         let hash = Hash::hash(height.to_be_bytes().as_slice());
-        blocks.insert(height, (hash, par_id));
+        let block_id = BlockId { height, hash };
+        blocks.insert(block_id, (hash, par_id));
         // update next parent id.
         par_id = BlockId { height, hash };
     }
