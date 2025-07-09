@@ -238,8 +238,6 @@ type SkipListNode<V> = Node<(u32, V)>;
 
 impl<V> SkipListNode<V> {
     /// Get the `key` of this node.
-    ///
-    /// The head node returns a key equal to `u32::MAX`.
     pub fn key(&self) -> Option<u32> {
         self.value.as_ref().map(|&(k, _)| k)
     }
