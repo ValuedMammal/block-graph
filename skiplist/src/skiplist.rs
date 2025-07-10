@@ -78,9 +78,8 @@ where
     fn level(&mut self) -> usize {
         let mut level = 0;
         let p = 0.5;
-        loop {
-            let rand = self.rng.gen_bool(p);
-            if !rand || level > self.levels {
+        while level + 1 < self.levels {
+            if !self.rng.gen_bool(p) {
                 break;
             }
             level += 1;
