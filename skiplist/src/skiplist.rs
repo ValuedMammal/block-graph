@@ -3,7 +3,6 @@
 // Loosely based on <https://github.com/JP-Ellis/rust-skiplist>.
 
 use alloc::boxed::Box;
-use core::fmt;
 use core::ops::RangeBounds;
 
 use rand::rngs::ThreadRng;
@@ -25,16 +24,13 @@ pub struct SkipList<T> {
     rng: ThreadRng,
 }
 
-impl<T: fmt::Debug + Clone + PartialEq> PartialEq for SkipList<T> {
+impl<T: Clone + PartialEq> PartialEq for SkipList<T> {
     fn eq(&self, other: &Self) -> bool {
         self.iter().cloned().eq(other.iter().cloned())
     }
 }
 
-impl<T> SkipList<T>
-where
-    T: fmt::Debug,
-{
+impl<T> SkipList<T> {
     /// Create a new skiplist with the given capacity.
     ///
     /// This will compute the number of levels from the desired capacity, for example given
@@ -203,7 +199,7 @@ mod test {
     use std::collections::{BTreeMap, BTreeSet};
 
     // Helper to display elements of SkipList.
-    fn print_skiplist<T: fmt::Debug>(node: &Node<T>) {
+    fn print_skiplist<T>(node: &Node<T>) {
         for level in (0..node.level).rev() {
             println!("\n===== Level {level} =====");
             let (level_node, _) = node.advance_while(level, |n, _| {

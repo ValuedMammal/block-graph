@@ -3,7 +3,6 @@
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::fmt;
 use core::mem;
 use core::ptr;
 use core::ptr::NonNull;
@@ -324,7 +323,6 @@ pub struct InsertOrReplace<T, F> {
 
 impl<T, F> InsertOrReplace<T, F>
 where
-    T: fmt::Debug,
     F: FnOnce(u32, T) -> Box<SkipListNode<T>>,
 {
     /// Create new [`InsertOrReplace`] with the given `key`, `value`, and `make_node` fn.
