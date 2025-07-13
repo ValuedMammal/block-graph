@@ -39,9 +39,8 @@ impl<T> SkipList<T> {
     /// - Use a probability `p = 0.5` of finding a node at the next level
     /// - Find the log (base 2) of `cap`, or about 20 levels.
     ///
-    /// It is possible for the skiplist to grow beyond the specified `cap`, but note that
-    /// the supposed performance benefits can diminish as higher levels grow more densely
-    /// packed.
+    /// It is possible for the skiplist to grow beyond the specified `cap`, but the supposed
+    /// performance benefits can diminish as higher levels become more densely populated.
     pub fn with_capacity(cap: usize) -> Self {
         let levels = core::cmp::max(1, (cap as f64).log2().round() as usize);
         let head = Box::new(Node::new_head(levels));
@@ -96,11 +95,9 @@ impl<T> SkipList<T> {
 
     /// Get a reference to the node at the given `index`.
     ///
-    /// Here index refers not to the value of node's key, but rather the value of the i-th
-    /// element of the collection.
-    ///
-    /// Note also that since nodes are arranged in descending key order, the node at index 0
-    /// should always return the node with the highest key.
+    /// Here index refers not to the node key, but the value of the i-th element of the collection.
+    /// Note also that since nodes are arranged in descending key order, the node at index 0 will
+    /// return the node with the highest key.
     fn get_index(&self, index: usize) -> Option<&Node<T>> {
         if index >= self.len {
             return None;
@@ -109,9 +106,10 @@ impl<T> SkipList<T> {
         self.head.advance(index + 1)
     }
 
-    /// Insert `T` at the target `height`.
+    /// Insert a `value` at the specified `height`.
     ///
-    /// Returns `None` if the value was newly inserted, or some old value if the value was replaced.
+    /// Returns `None` if a value at `height` was not present, or if the key was already present
+    /// the value is updated and the old value is returned.
     pub fn insert(&mut self, height: u32, value: T) -> Option<T> {
         let level = self.level();
 
@@ -146,7 +144,7 @@ impl<T> SkipList<T> {
         SkipListIter::from_head(self.head.as_ref(), self.len)
     }
 
-    /// Range.
+    /// Iterate over nodes of the skiplist while the keys are in the provided `range`.
     pub fn range(&self, range: impl RangeBounds<u32>) -> impl Iterator<Item = &(u32, T)> {
         use core::ops::Bound;
         let start: u32 = match range.start_bound().cloned() {
@@ -162,7 +160,6 @@ impl<T> SkipList<T> {
 
         let node = node::Seek::new(end).seek(self.head.as_ref());
 
-        // Iterate nodes of the bottom level while the keys are in the intended range.
         let mut cur = node.next_ref();
         core::iter::from_fn(move || {
             let node = cur?;

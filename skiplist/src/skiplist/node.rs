@@ -51,7 +51,6 @@ impl<T> Node<T> {
 
     /// Whether this [`Node`] is a head node. By definition the head
     /// has no predecessor.
-    #[allow(unused)]
     pub fn is_head(&self) -> bool {
         self.prev.is_none()
     }
@@ -213,8 +212,10 @@ impl<T> Node<T> {
         }
     }
 
-    /// Compute the distance to `target` at the specified level. If no target is given, return
-    /// the distance from this node to the last reachable node at level.
+    /// Compute the distance to `target` at the specified level.
+    ///
+    /// If no target is given, return the distance from this node to the last reachable node at
+    /// level.
     pub fn distance_at_level(&self, level: usize, target: Option<&Self>) -> Result<usize, ()> {
         match target {
             Some(target) => {
@@ -369,9 +370,9 @@ where
         if let Some(target_node) = node.next_mut(0) {
             if let Some(node_key) = target_node.key() {
                 if node_key == target_key {
-                    let old_val =
+                    let old_value =
                         mem::replace(target_node.value_mut().expect("must have value"), self.value);
-                    return Err(old_val);
+                    return Err(old_value);
                 }
             }
         }
@@ -406,7 +407,7 @@ where
     }
 }
 
-/// Type used to remove a value from `SkipLIst`.
+/// Type used to remove a value from `SkipList`.
 pub struct Remove<T> {
     key: u32,
     marker: core::marker::PhantomData<T>,
@@ -426,6 +427,7 @@ impl<T> Remove<T> {
         node: &mut SkipListNode<T>,
         level: usize,
     ) -> Result<(Box<SkipListNode<T>>, usize), ()> {
+        // SAFETY: `level_head` must point to a valid Node, so it is safe to dereference.
         unsafe {
             let (level_head, distance_this_level) =
                 node.advance_while_mut(level, |_, next| next.key().map_or(true, |k| k > self.key));
@@ -444,7 +446,7 @@ impl<T> Remove<T> {
         }
     }
 
-    // Act on the node by removing the the value after `level_node` if it matches
+    // Act on the node by removing the value after `level_node` if it matches
     // the target key.
     pub fn remove(&self, level_node: &mut SkipListNode<T>) -> Result<Box<SkipListNode<T>>, ()> {
         let target_key = self.key;
@@ -532,6 +534,8 @@ pub struct SkipListIter<'a, T> {
 }
 
 impl<'a, T> SkipListIter<'a, T> {
+    /// Construct a [`SkipListIter`] from a head node.
+    ///
     /// Note: The caller is responsible for ensuring there are `len` nodes after `head`.
     pub(crate) fn from_head(head: &'a Node<T>, len: usize) -> Self {
         if len == 0 {
@@ -593,8 +597,7 @@ impl<T> ExactSizeIterator for SkipListIter<'_, T> {}
 
 /// Node iter.
 #[derive(Debug)]
-#[allow(unused)]
-pub(crate) struct NodeIter<'a, T> {
+pub struct NodeIter<'a, T> {
     current: Option<&'a Node<T>>,
 }
 
