@@ -301,7 +301,7 @@ where
     ///
     /// This is here in order to remain interoperable with code that interfaces with
     /// [`LocalChain`](bdk_chain::local_chain::LocalChain), etc.
-    fn checkpoint(&self) -> CheckPoint<T> {
+    pub fn checkpoint(&self) -> CheckPoint<T> {
         self.tip
             .iter()
             .rev()
