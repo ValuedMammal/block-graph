@@ -98,6 +98,21 @@ where
         None
     }
 
+    /// Get a reference to the node at the given `index`.
+    ///
+    /// Here index refers not to the value of node's key, but rather the value of the i-th
+    /// element of the collection.
+    ///
+    /// Note also that since nodes are arranged in descending key order, the node at index 0
+    /// should always return the node with the highest key.
+    fn get_index(&self, index: usize) -> Option<&Node<T>> {
+        if index >= self.len {
+            return None;
+        }
+
+        self.head.advance(index + 1)
+    }
+
     /// Insert `T` at the target `height`.
     ///
     /// Returns `None` if the value was newly inserted, or some old value if the value was replaced.
@@ -162,6 +177,15 @@ where
             cur = node.next_ref();
             node.value.as_ref()
         })
+    }
+}
+
+impl<T> core::ops::Index<usize> for SkipList<T> {
+    type Output = (u32, T);
+
+    fn index(&self, index: usize) -> &Self::Output {
+        let node = self.get_index(index).expect("index out of bounds");
+        node.value.as_ref().expect("node must not be head")
     }
 }
 
@@ -329,5 +353,36 @@ mod test {
 
         let missing_height = exp_len as u32;
         assert!(skiplist.remove(missing_height).is_none());
+    }
+
+    #[test]
+    fn test_skiplist_index() {
+        let mut skiplist = SkipList::<i32>::with_capacity(100);
+
+        assert!(skiplist.get_index(0).is_none());
+
+        // Insert 10 values
+        for key in 0..10 {
+            let value = 1 << (key as i32);
+            skiplist.insert(key, value);
+        }
+
+        assert_eq!(skiplist.len(), 10);
+
+        // Index operation should not panic
+        for test_index in 0..10 {
+            let _value = skiplist[test_index];
+        }
+
+        assert!(skiplist.get_index(skiplist.len).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "index out of bounds")]
+    fn test_skiplist_index_out_of_bounds() {
+        let mut skiplist = SkipList::<i32>::with_capacity(100);
+        assert!(skiplist.is_empty());
+
+        let _no_value = skiplist[0];
     }
 }

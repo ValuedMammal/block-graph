@@ -231,6 +231,32 @@ impl<T> Node<T> {
             }
         }
     }
+
+    /// Move for `max_distance` steps and return a reference to the target node if it exists.
+    pub fn advance(&self, max_distance: usize) -> Option<&Self> {
+        let level = self.level;
+        let mut node = self;
+        let mut traveled = 0;
+
+        for level in (0..=level).rev() {
+            let (level_node, _) = node.advance_while(level, |cur_node, _| {
+                let step = cur_node.links_len[level];
+                if step + traveled <= max_distance {
+                    traveled += step;
+                    true
+                } else {
+                    false
+                }
+            });
+            node = level_node;
+        }
+
+        if traveled == max_distance {
+            Some(node)
+        } else {
+            None
+        }
+    }
 }
 
 /// Alias for a node in the [`SkipList`](super::SkipList).
