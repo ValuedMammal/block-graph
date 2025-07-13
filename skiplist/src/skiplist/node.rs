@@ -342,6 +342,7 @@ where
         node: &mut SkipListNode<T>,
         level: usize,
     ) -> Result<(&mut SkipListNode<T>, usize), T> {
+        // SAFETY: `level_head` must point to a valid Node, so it is safe to dereference.
         unsafe {
             let (level_head, distance_this_level) =
                 node.advance_while_mut(level, |_, next| next.key().map_or(true, |k| k > self.key));
@@ -351,10 +352,10 @@ where
                 Ok((node, distance_this_level))
             } else {
                 // Recurse at (level - 1)...
-                let (mut node, distance_after_head) =
+                let (node, distance_after_head) =
                     self.seek_and_insert_or_replace(level_head, level - 1)?;
                 let level_head = &mut *level_head_ptr;
-                Self::insertion_fixup(level, level_head, distance_after_head, &mut node);
+                Self::insertion_fixup(level, level_head, distance_after_head, node);
                 Ok((node, distance_this_level + distance_after_head))
             }
         }
@@ -388,11 +389,14 @@ where
         level: usize,
         level_head: &mut SkipListNode<T>,
         distance_from_parent: usize,
-        new_node: &mut &mut SkipListNode<T>,
+        new_node: &mut SkipListNode<T>,
     ) {
+        if level == 0 {
+            return;
+        }
         if level <= new_node.level {
             new_node.links[level] = level_head.links[level];
-            level_head.links[level] = NonNull::new(*new_node);
+            level_head.links[level] = NonNull::new(new_node);
             let old_len = level_head.links_len[level];
             new_node.links_len[level] = old_len - distance_from_parent;
             level_head.links_len[level] = distance_from_parent + 1;
