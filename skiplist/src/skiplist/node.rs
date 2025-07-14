@@ -163,7 +163,7 @@ impl<T> Node<T> {
         pred: impl FnOnce(&Self, &Self) -> bool,
     ) -> Result<(&Self, usize), &Self> {
         // SAFETY: ptr to `Node` is always convertible to a reference.
-        let next = unsafe { self.links[level].and_then(|p| p.as_ptr().as_ref()) };
+        let next = unsafe { self.links[level].map(|p| p.as_ref()) };
         match next {
             Some(next) if pred(self, next) => Ok((next, self.links_len[level])),
             _ => Err(self),
@@ -205,7 +205,7 @@ impl<T> Node<T> {
         pred: impl FnOnce(&Self, &Self) -> bool,
     ) -> Result<(&mut Self, usize), &mut Self> {
         // SAFETY: ptr to `Node` is always convertible to a reference.
-        let next = unsafe { self.links[level].and_then(|p| p.as_ptr().as_mut()) };
+        let next = unsafe { self.links[level].map(|mut p| p.as_mut()) };
         match next {
             Some(next) if pred(self, next) => Ok((next, self.links_len[level])),
             _ => Err(self),
