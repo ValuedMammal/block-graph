@@ -525,6 +525,15 @@ impl<T> Node<T> {
     }
 }
 
+impl<T> Drop for Node<T> {
+    fn drop(&mut self) {
+        let mut tail = self.take_tail();
+        while let Some(mut next_node) = tail {
+            tail = next_node.take_tail();
+        }
+    }
+}
+
 /// An iterator for SkipList allowing both forwards and backwards iteration.
 #[derive(Debug)]
 pub struct SkipListIter<'a, T> {
