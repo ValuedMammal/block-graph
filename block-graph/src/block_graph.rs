@@ -372,11 +372,6 @@ where
                             // Compare block hashes.
                             if update.hash() == original.hash() {
                                 point_of_agreement = Some(original.height());
-                                // OPTIMIZATION: If we have the same underlying pointer we can guarantee
-                                // no more blocks will be introduced.
-                                if update.eq_ptr(original) {
-                                    break;
-                                }
                             } else {
                                 // We have an explicit invalidation height. Update the changeset, as long
                                 // as it does not conflict with the root (0).
