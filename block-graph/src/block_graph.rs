@@ -330,9 +330,14 @@ where
         &self,
         update: CheckPoint<T>,
     ) -> Result<(ChangeSet<T>, Vec<BlockId>), CannotConnectError> {
-        let cp = self.checkpoint();
-
-        let mut original_tip = cp.iter().peekable();
+        // Create an iterator that visits every item as a CheckPoint,
+        // noting this is somewhat of a hack since checkpoints of the original
+        // tip are not linked to one another via their `prev`.
+        let mut original_tip = self
+            .tip
+            .iter()
+            .map(|&(height, value)| CheckPoint::new(height, value))
+            .peekable();
         let mut update_tip = update.iter().peekable();
 
         let mut point_of_agreement = None;
