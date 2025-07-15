@@ -606,6 +606,7 @@ impl<T> ExactSizeIterator for SkipListIter<'_, T> {}
 
 /// Node iter.
 #[derive(Debug)]
+#[allow(unused)]
 pub struct NodeIter<'a, T> {
     current: Option<&'a Node<T>>,
 }

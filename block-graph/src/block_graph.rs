@@ -404,11 +404,8 @@ where
             && !is_prev_orig_invalid
         {
             let prev_orig = potentially_invalid_blocks.pop().expect("it wasn't empty");
-            println!("Found no PoA, try height={}", prev_orig.height);
             return Err(CannotConnectError(prev_orig.height));
         }
-
-        println!("PoA={:?}", point_of_agreement);
 
         // To produce a changeset we need to flatten the optional parent id, which we can do
         // by finding the next nearest block of the *original chain* that sits at a lower height
@@ -420,7 +417,6 @@ where
             .map(|(id, (block, par))| {
                 let par = par.unwrap_or_else(|| {
                     let height = id.height;
-                    println!("Finding parent of height={}", height);
                     self.tip
                         .range(..height)
                         .next()

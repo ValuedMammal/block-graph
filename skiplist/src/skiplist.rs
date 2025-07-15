@@ -140,7 +140,7 @@ impl<T> SkipList<T> {
     }
 
     /// Iterate over nodes in the skiplist.
-    pub fn iter(&self) -> SkipListIter<(u32, T)> {
+    pub fn iter(&self) -> SkipListIter<'_, (u32, T)> {
         SkipListIter::from_head(self.head.as_ref(), self.len)
     }
 
@@ -206,7 +206,7 @@ mod test {
                 } else {
                     let key = n.key().unwrap();
                     let dist = n.links_len[level];
-                    print!(" - K[{}] d({})", key, dist);
+                    print!(" - K[{key}] d({dist})");
                 }
                 true
             });
