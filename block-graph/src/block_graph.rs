@@ -396,15 +396,13 @@ where
             }
         }
 
-        // Fail if no PoA is found after traversing blocks of the original chain,
+        // Fail if no point of agreement is found after traversing blocks of the original chain,
         // unless there's an explicit invalidation, meaning 1 or more blocks
         // were reorged.
-        if point_of_agreement.is_none()
-            && !potentially_invalid_blocks.is_empty()
-            && !is_prev_orig_invalid
-        {
-            let prev_orig = potentially_invalid_blocks.pop().expect("it wasn't empty");
-            return Err(CannotConnectError(prev_orig.height));
+        if point_of_agreement.is_none() && !is_prev_orig_invalid {
+            let try_height =
+                potentially_invalid_blocks.last().cloned().unwrap_or(self.tip()).height;
+            return Err(CannotConnectError(try_height));
         }
 
         // To produce a changeset we need to flatten the optional parent id, which we can do
@@ -509,7 +507,6 @@ mod test {
             blocks.push(BlockId { height, hash });
         }
         let _ = graph.apply_update(cp).unwrap();
-        dbg!(&graph);
 
         blocks.reverse();
         let tip_blocks = graph
@@ -594,23 +591,6 @@ mod test {
     }
 
     #[test]
-    fn test_merge_chains_no_point_of_agreement_ok() {
-        // case: connect 1 (no PoA) by strictly extending should be ok
-        let genesis_block = BlockId {
-            height: 0,
-            hash: Hash::hash(b"0"),
-        };
-        let mut graph = BlockGraph::from_genesis(genesis_block.hash);
-        let block_1 = BlockId {
-            height: 1,
-            hash: Hash::hash(b"one"),
-        };
-        let tip = CheckPoint::new(1, block_1.hash);
-        let changeset = graph.apply_update(tip).unwrap();
-        assert_eq!(changeset.blocks, [(block_1, (block_1.hash, genesis_block))].into());
-    }
-
-    #[test]
     fn test_merge_chains_error() {
         // case: error if no PoA
         // 0-x-B
@@ -619,21 +599,26 @@ mod test {
             height: 0,
             hash: Hash::hash(b"0"),
         };
-        let mut graph = BlockGraph::from_genesis(genesis_block.hash);
         let block_2 = BlockId {
             height: 2,
             hash: Hash::hash(b"2"),
         };
-        let update = CheckPoint::new(block_2.height, block_2.hash);
-        let changeset = graph.apply_update(update).unwrap();
-        assert!(!changeset.blocks.is_empty());
+        let changeset = ChangeSet {
+            blocks: [
+                (genesis_block, (genesis_block.hash, BlockId::default())),
+                (block_2, (block_2.hash, genesis_block)),
+            ]
+            .into(),
+        };
+        let graph = BlockGraph::from_changeset(changeset).unwrap().unwrap();
+
         // Now try to insert block 1
         let block_1 = BlockId {
             height: 1,
             hash: Hash::hash(b"1"),
         };
         let update = CheckPoint::new(block_1.height, block_1.hash);
-        let res = graph.apply_update(update);
+        let res = graph.merge_chains(update);
         assert!(matches!(
             res,
             Err(CannotConnectError(height)) if height == 2,
