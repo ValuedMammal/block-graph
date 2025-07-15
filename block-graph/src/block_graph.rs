@@ -305,11 +305,13 @@ where
         self.tip
             .iter()
             .rev()
-            .fold(Option::<CheckPoint<T>>::None, |acc, (height, block)| match acc {
-                Some(cp) => Some(cp.push(*height, *block).expect("blocks are in order")),
-                None => Some(CheckPoint::new(*height, *block)),
+            .fold(Option::<CheckPoint<T>>::None, |acc, &item| match acc {
+                None => Some(CheckPoint::from_blocks([item]).expect("CP must be non-empty")),
+                Some(cp) => {
+                    Some(cp.extend([item]).expect("blocks must be in ascending height order"))
+                }
             })
-            .expect("chain tip must be non-empty")
+            .expect("`self.tip` must be non-empty")
     }
 
     /// Merges `update` with `self` and returns the resulting [`ChangeSet`], along with any
@@ -514,6 +516,37 @@ mod test {
             .map(|(height, &hash)| BlockId { height, hash })
             .collect::<Vec<_>>();
         assert_eq!(tip_blocks, blocks);
+    }
+
+    #[test]
+    fn test_checkpoint() {
+        let genesis_block = BlockId {
+            height: 0,
+            hash: Hash::hash(b"0"),
+        };
+        let block_1 = BlockId {
+            height: 1,
+            hash: Hash::hash(b"1"),
+        };
+        let block_2 = BlockId {
+            height: 2,
+            hash: Hash::hash(b"2"),
+        };
+        let changeset = ChangeSet {
+            blocks: [
+                (genesis_block, (genesis_block.hash, BlockId::default())),
+                (block_1, (block_1.hash, genesis_block)),
+                (block_2, (block_2.hash, block_1)),
+            ]
+            .into(),
+        };
+        let graph = BlockGraph::from_changeset(changeset).unwrap().unwrap();
+
+        let cp = graph.checkpoint();
+        assert_eq!(cp.clone().iter().count(), 3);
+        assert_eq!(cp.get(2).map(|cp| cp.block_id()), Some(block_2));
+        assert_eq!(cp.get(1).map(|cp| cp.block_id()), Some(block_1));
+        assert_eq!(cp.get(0).map(|cp| cp.block_id()), Some(genesis_block));
     }
 
     #[test]
