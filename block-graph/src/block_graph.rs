@@ -69,19 +69,19 @@ impl<T: ToBlockHash + fmt::Debug + Ord + Clone> BlockGraph<T> {
         }
     }
 
-    /// Get the value of a node in the block graph by a given `height`.
+    /// Get the value of a node in the best chain by `height`.
     pub fn get(&self, height: u32) -> Option<&T> {
         self.tip.get(height)
     }
 
     /// Iterate items of the canonical chain.
-    pub fn iter(&self) -> impl Iterator<Item = (u32, &T)> {
-        self.tip.iter().map(|(k, v)| (*k, v))
+    pub fn iter(&self) -> impl Iterator<Item = &(u32, T)> {
+        self.tip.iter()
     }
 
     /// Iterate items of the canonical chain within a specified `range` of heights.
-    pub fn range(&self, range: impl RangeBounds<u32>) -> impl Iterator<Item = (u32, &T)> {
-        self.tip.range(range).map(|(k, v)| (*k, v))
+    pub fn range(&self, range: impl RangeBounds<u32>) -> impl Iterator<Item = &(u32, T)> {
+        self.tip.range(range)
     }
 
     /// Retrieve the block id of a given `hash` if it exists.
@@ -515,10 +515,7 @@ mod test {
         let _ = graph.apply_update(cp).unwrap();
 
         blocks.reverse();
-        let tip_blocks = graph
-            .iter()
-            .map(|(height, &hash)| BlockId { height, hash })
-            .collect::<Vec<_>>();
+        let tip_blocks = graph.iter().copied().map(BlockId::from).collect::<Vec<_>>();
         assert_eq!(tip_blocks, blocks);
     }
 
