@@ -152,25 +152,26 @@ impl<T: ToBlockHash + fmt::Debug + Ord + Clone> BlockGraph<T> {
 
         let best_block = match best_block {
             Some(b) => b,
-            None => return Ok(None),
+            None => {
+                debug_assert!(false, "failed to find best tip");
+                return Ok(None);
+            }
         };
 
         // Now that we know the tip we need to populate the canonical chain
-        // by traversing back to the root and collecting items of `T` along the way.
-        let blocks = &graph.blocks;
-        let mut cur = best_block.hash;
-        let graph_iter = core::iter::from_fn(|| {
-            let (height, block) = blocks.get(&cur)?;
-            let block_id = BlockId {
-                height: *height,
-                hash: block.to_blockhash(),
+        // by traversing back to the root and inserting block data along
+        // the way.
+        let mut cur = Some(best_block.hash);
+        while let Some(hash) = cur {
+            // Get block data from graph.
+            let (height, block_data) = match graph.blocks.get(&hash).cloned() {
+                Some(value) => value,
+                None => break,
             };
-            let prev = prev_hashes.get(&block_id).copied()?;
-            cur = prev;
-            Some((*height, block.clone()))
-        });
-        for (height, block) in graph_iter {
-            graph.tip.insert(height, block);
+            // Insert data into tip.
+            graph.tip.insert(height, block_data);
+            // Get next parent hash.
+            cur = prev_hashes.get(&(height, hash).into()).copied();
         }
 
         Ok(Some(graph))
