@@ -86,9 +86,9 @@ impl<T: ToBlockHash + fmt::Debug + Ord + Clone> BlockGraph<T> {
 
     /// Retrieve the block id of a given `hash` if it exists.
     pub fn block_id(&self, hash: &BlockHash) -> Option<BlockId> {
-        self.blocks.get(hash).map(|(height, block)| BlockId {
+        self.blocks.get(hash).map(|(height, _)| BlockId {
             height: *height,
-            hash: block.to_blockhash(),
+            hash: *hash,
         })
     }
 
@@ -180,15 +180,16 @@ impl<T: ToBlockHash + fmt::Debug + Ord + Clone> BlockGraph<T> {
     /// Obtain an initial changeset. The initial changeset represents the difference between `self` and
     /// an empty [`BlockGraph`].
     pub fn initial_changeset(&self) -> ChangeSet<T> {
+        let root_hash = self.root;
         let (genesis_height, genesis_data) = self
             .blocks
-            .get(&self.root)
+            .get(&root_hash)
             .cloned()
             .expect("BlockGraph must contain root");
         assert_eq!(genesis_height, 0);
         let genesis_block_id = BlockId {
             height: genesis_height,
-            hash: genesis_data.to_blockhash(),
+            hash: root_hash,
         };
 
         let mut blocks = BTreeMap::new();
@@ -197,14 +198,13 @@ impl<T: ToBlockHash + fmt::Debug + Ord + Clone> BlockGraph<T> {
         blocks.insert(genesis_block_id, (genesis_data, BlockId::default()));
 
         for (par_hash, extends) in &self.next_hashes {
-            for hash in extends {
+            for &hash in extends {
                 // Get the orginal block corresponding to `hash`.
                 let (height, block) = self
                     .blocks
-                    .get(hash)
+                    .get(&hash)
                     .cloned()
                     .expect("failed to get block for hash in next_hashes");
-                let hash = block.to_blockhash();
                 let block_id = BlockId { height, hash };
                 // Get the id of the parent, i.e. the block from which the original extends.
                 let par_id = self.block_id(par_hash).expect("must have block of parent hash");
@@ -273,7 +273,10 @@ impl<T: fmt::Debug + Clone + PartialEq> PartialEq for BlockGraph<T> {
     ))
 )]
 pub struct ChangeSet<T> {
-    /// Maps block_id -> (T, parent_id)
+    /// The block data, which can be seen as a map of `block_id` -> `(T, parent_id)`.
+    ///
+    /// `T` represents the generic block data, typically something that implements the trait
+    /// [`ToBlockHash`].
     pub blocks: BTreeMap<BlockId, (T, BlockId)>,
 }
 
