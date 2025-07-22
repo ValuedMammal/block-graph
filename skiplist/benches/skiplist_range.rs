@@ -17,10 +17,6 @@ fn skiplist_range(c: &mut Criterion) {
 
     let mut skiplist = SkipList::<BlockHash>::with_capacity(CT);
 
-    // SkipList results
-    // 10k: 15 us
-    // 100k: 7 us
-
     for i in 0..CT {
         let height = i as u32;
         let _ = skiplist.insert(height, BlockHash::all_zeros());

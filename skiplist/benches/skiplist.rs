@@ -17,9 +17,6 @@ fn skiplist(c: &mut Criterion) {
 
     let mut skiplist = SkipList::with_capacity(CT);
 
-    // SkipList results
-    // 100k: ~30ns
-
     for i in 0..CT {
         let height = i as u32;
         let hash = BlockHash::all_zeros();

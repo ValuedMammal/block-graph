@@ -23,9 +23,6 @@ fn from_changeset(c: &mut Criterion) {
     let mut changeset = block_graph::ChangeSet::default();
     let blocks = &mut changeset.blocks;
 
-    // BlockGraph results
-    // 10k: 5 ms
-
     let mut par_id = BlockId::default();
 
     for i in 0..CT {

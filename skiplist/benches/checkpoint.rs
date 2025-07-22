@@ -15,9 +15,6 @@ fn checkpoint(c: &mut Criterion) {
 
     let mut cp = CheckPoint::new(0, Hash::hash(b"0"));
 
-    // CheckPoint results
-    // 100k: 380 us
-
     for i in 1..CT {
         let height = i as u32;
         let hash = Hash::hash(height.to_be_bytes().as_slice());
