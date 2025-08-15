@@ -33,7 +33,7 @@ We get around this limitation by reinterpreting a value of `Node` through the us
 
 The reason we're able to do this with CheckPoint is that CheckPoint just wraps a `CPInner`, that is, it is functionally equivalent to the inner node structure. Perhaps surprisingly, iterating a CheckPoint yields items of... well, CheckPoint. But unlike a checkpoint, `SkipList<T>` when iterated does not yield items of itself, rather it yields items of `&(u32, T)`. This is analogous to getting the height (`u32`) and block data (`T`) from a `CheckPoint<T>`.
 
-As a high level data structure SkipList does not behave like any other Node, because it contains extra information related to the levels and capacity, it holds a pointer to the head node, as well as the logic of level generation (`rng`). On the plus side, we can convert the canonical chain of BlockGraph into a CheckPoint if we choose (a singly linked-list is enough if all we need is to iterate blocks from the tip), allowing us to pass it directly to a chain source just as you would when updating a LocalChain.
+As a high level data structure SkipList does not behave like any other Node, because it contains extra information related to the levels and capacity, it holds a pointer to the head node, as well as the logic of level generation (`rng`). On the plus side, we can convert the canonical chain of BlockGraph into a CheckPoint if we choose (a singly linked list is enough if all we need is to iterate blocks from the tip), allowing us to pass it directly to a chain source just as you would when updating a LocalChain.
 
 **Alternatives?**
 
