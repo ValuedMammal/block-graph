@@ -133,7 +133,7 @@ impl<T> Node<T> {
     /// This method takes a `pred` closure which given a reference to the current and next node
     /// determines whether to advance.
     ///
-    /// Returns A tuple `(node, distance)` representing the target node and distance moved.
+    /// Returns a tuple `(node, distance)` representing the target node and distance moved.
     pub fn advance_while(
         &self,
         level: usize,
@@ -299,9 +299,11 @@ impl<T> Seek<T> {
     /// Seek to the nearest node matching the target key.
     ///
     /// When traversing the skiplist we advance at each level while the *next key*
-    /// is greater than the target key. The "target node" will be the `.next_ref` node
+    /// is greater than the target key. The target node will be the [`next_ref`] node
     /// following the returned node (not the node itself). This enables us to continue
     /// traversing at lower levels without overshooting the target.
+    ///
+    /// [`next_ref`]: Node::next_ref
     pub fn seek<'a>(&self, node: &'a SkipListNode<T>) -> &'a SkipListNode<T> {
         let target_key = self.key;
         let levels = node.level;
@@ -424,6 +426,8 @@ impl<T> Remove<T> {
         }
     }
 
+    /// Seek to the nearest node to the target node to be removed and return it,
+    /// or error if the target key is not found.
     pub fn seek_and_remove(
         self,
         node: &mut SkipListNode<T>,
@@ -448,9 +452,9 @@ impl<T> Remove<T> {
         }
     }
 
-    // Act on the node by removing the value after `level_node` if it matches
-    // the target key.
-    pub fn remove(&self, level_node: &mut SkipListNode<T>) -> Result<Box<SkipListNode<T>>, ()> {
+    /// Act on the node by removing the value after `level_node` if it matches
+    /// the target key.
+    fn remove(&self, level_node: &mut SkipListNode<T>) -> Result<Box<SkipListNode<T>>, ()> {
         let target_key = self.key;
 
         match level_node.next_ref() {

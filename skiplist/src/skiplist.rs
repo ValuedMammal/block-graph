@@ -132,8 +132,7 @@ impl<T> SkipList<T> {
         match remove.seek_and_remove(head, head.level) {
             Ok((mut node, _)) => {
                 self.len -= 1;
-                let (_key, value) = node.value.take()?;
-                Some(value)
+                node.value.take().map(|(_k, v)| v)
             }
             Err(..) => None,
         }
