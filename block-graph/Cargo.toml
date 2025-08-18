@@ -7,7 +7,7 @@ readme = "README.md"
 
 [dependencies]
 # LagginTimes:generic_checkpoint
-bdk_chain = { git = "https://github.com/LagginTimes/bdk", rev = "dabb869f77b6cb548e4a82c15b250df460695b24" }
+bdk_chain = { git = "https://github.com/LagginTimes/bdk", rev = "4dce5add0801bdbb52e1997386aed8f3455ff88e" }
 # bdk_chain = { path = "../../bdk/crates/chain", default-features = false }
 serde = { version = "1", default-features = false, features = ["derive"], optional = true }
 skiplist = { path = "../skiplist", version = "0.1.0" }
