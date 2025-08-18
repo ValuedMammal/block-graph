@@ -183,21 +183,18 @@ impl<T> core::ops::Index<usize> for SkipList<T> {
 }
 
 #[cfg(test)]
-#[allow(unused)]
 mod test {
     use super::*;
 
     use bdk_chain::bitcoin;
-    use bdk_chain::BlockId;
     use bitcoin::hashes::Hash;
     use bitcoin::BlockHash;
 
-    use crate::skiplist::node::SkipListIter;
     use std::collections::{BTreeMap, BTreeSet};
 
     // Helper to display elements of SkipList.
     fn print_skiplist<T>(node: &Node<T>) {
-        for level in (0..node.level).rev() {
+        for level in (0..=node.level).rev() {
             println!("\n===== Level {level} =====");
             let (level_node, _) = node.advance_while(level, |n, _| {
                 if n.value.is_none() {
@@ -225,7 +222,6 @@ mod test {
     fn test_skiplist_insert() {
         //
         // 0-1-2-3-...-H
-        use node::SkipListIter;
         let exp_len = 50;
         let mut skiplist = SkipList::<BlockHash>::with_capacity(exp_len);
 
@@ -241,8 +237,8 @@ mod test {
 
         // Test range
         let exp_range = 5..=13;
-        let keys: BTreeSet<u32> = skiplist.range(exp_range.clone()).map(|(k, v)| *k).collect();
-        assert_eq!(keys, exp_range.into_iter().collect::<BTreeSet<_>>());
+        let keys: BTreeSet<u32> = skiplist.range(exp_range.clone()).map(|(k, _v)| *k).collect();
+        assert_eq!(keys, exp_range.collect::<BTreeSet<_>>());
     }
 
     #[test]
@@ -260,7 +256,7 @@ mod test {
             skiplist.insert(height, hash);
         }
 
-        let mut iter = skiplist.iter();
+        let iter = skiplist.iter();
 
         for (exp_height, exp_value) in iter {
             assert_eq!(values.get(exp_height), Some(exp_value));
@@ -279,7 +275,7 @@ mod test {
             skiplist.insert(height, hash);
         }
         let exp_range = 5..=13;
-        let keys: BTreeSet<u32> = skiplist.range(exp_range.clone()).map(|(k, v)| *k).collect();
+        let keys: BTreeSet<u32> = skiplist.range(exp_range.clone()).map(|(k, _v)| *k).collect();
         assert_eq!(keys, exp_range.collect::<BTreeSet<_>>());
     }
 
@@ -340,7 +336,7 @@ mod test {
 
         // Test `remove`
         for height in [0, 1, 2] {
-            let removed_value = skiplist.remove(height).expect("should return removed value");
+            assert!(skiplist.remove(height).is_some(), "should return removed value");
             skiplist.head.check();
         }
 
@@ -373,7 +369,7 @@ mod test {
     #[test]
     #[should_panic(expected = "index out of bounds")]
     fn test_skiplist_index_out_of_bounds() {
-        let mut skiplist = SkipList::<i32>::with_capacity(100);
+        let skiplist = SkipList::<i32>::with_capacity(100);
         assert!(skiplist.is_empty());
 
         let _no_value = skiplist[0];
