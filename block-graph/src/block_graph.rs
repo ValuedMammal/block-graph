@@ -9,7 +9,7 @@ use core::ops::RangeBounds;
 use bdk_chain::{
     bitcoin, local_chain::MissingGenesisError, BlockId, CheckPoint, Merge, ToBlockHash,
 };
-use bitcoin::BlockHash;
+use bitcoin::{hashes::Hash, BlockHash};
 use skiplist::SkipList;
 
 use crate::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -20,7 +20,7 @@ pub const DEFAULT_CAPACITY: usize = 1 << 20;
 /// Block graph.
 #[derive(Debug)]
 pub struct BlockGraph<T> {
-    /// Nodes of `T` in the block graph keyed by block hash.
+    /// Nodes of `(Height, T)` in the block graph keyed by block hash.
     blocks: HashMap<BlockHash, (u32, T)>,
     /// `next_hashes` maps a block hash to the set of hashes extending from it.
     next_hashes: HashMap<BlockHash, HashSet<BlockHash>>,
@@ -47,7 +47,8 @@ impl<T: ToBlockHash + fmt::Debug + Ord + Clone> BlockGraph<T> {
 
         let mut blocks = HashMap::new();
         blocks.insert(genesis_hash, (genesis_height, block.clone()));
-        let next_hashes = HashMap::new();
+        let mut next_hashes = HashMap::new();
+        next_hashes.insert(BlockHash::all_zeros(), [genesis_hash].into());
         let root = genesis_hash;
         let mut tip = SkipList::with_capacity(cap);
         tip.insert(genesis_height, block);
@@ -82,6 +83,15 @@ impl<T: ToBlockHash + fmt::Debug + Ord + Clone> BlockGraph<T> {
     /// Iterate items of the canonical chain within a specified `range` of heights.
     pub fn range(&self, range: impl RangeBounds<u32>) -> impl Iterator<Item = &(u32, T)> {
         self.tip.range(range)
+    }
+
+    /// Return the genesis block data.
+    pub fn genesis_block(&self) -> T {
+        self.blocks
+            .get(&self.root)
+            .cloned()
+            .map(|(_, b)| b)
+            .expect("graph must contain root")
     }
 
     /// Retrieve the block id of a given `hash` if it exists.
@@ -124,11 +134,7 @@ impl<T: ToBlockHash + fmt::Debug + Ord + Clone> BlockGraph<T> {
             let BlockId { height, hash } = block_id;
             graph.blocks.insert(hash, (height, block));
             for par in parents {
-                // Skip adding to `next_hashes` for the genesis block, since
-                // it doesn't extend from anything.
-                if height != 0 {
-                    graph.next_hashes.entry(par.hash).or_default().insert(hash);
-                }
+                graph.next_hashes.entry(par.hash).or_default().insert(hash);
             }
         }
 
@@ -186,23 +192,22 @@ impl<T: ToBlockHash + fmt::Debug + Ord + Clone> BlockGraph<T> {
     /// Obtain an initial changeset. The initial changeset represents the difference between `self` and
     /// an empty [`BlockGraph`].
     pub fn initial_changeset(&self) -> ChangeSet<T> {
-        let root = self.root;
-        let (genesis_height, genesis_data) =
-            self.blocks.get(&root).cloned().expect("BlockGraph must contain root");
-        assert_eq!(genesis_height, 0);
-        let genesis_block_id = BlockId {
-            height: genesis_height,
-            hash: root,
-        };
-
         let mut changeset = ChangeSet::default();
         let blocks = &mut changeset.blocks;
 
-        // Remember to include the root since it doesn't have an entry in `next_hashes`.
-        blocks.insert(genesis_block_id, (genesis_data, [BlockId::default()].into()));
-
         for (par_hash, extends) in &self.next_hashes {
-            // Get the id of the parent.
+            // Include the genesis entry, but avoid fetching a non-existing parent.
+            if *par_hash == BlockHash::all_zeros() {
+                blocks.insert(
+                    BlockId {
+                        height: 0,
+                        hash: self.root,
+                    },
+                    (self.genesis_block(), [BlockId::default()].into()),
+                );
+                continue;
+            }
+
             let par_id = self.block_id(par_hash).expect("invariant");
 
             for &hash in extends {
@@ -240,11 +245,7 @@ impl<T: ToBlockHash + fmt::Debug + Ord + Clone> BlockGraph<T> {
             let BlockId { height, hash } = id;
             self.blocks.insert(hash, (height, block.clone()));
             for par in parents {
-                // Skip adding to `next_hashes` for the genesis block, since
-                // it doesn't extend from anything.
-                if height > 0 {
-                    self.next_hashes.entry(par.hash).or_default().insert(hash);
-                }
+                self.next_hashes.entry(par.hash).or_default().insert(hash);
             }
         }
 
@@ -479,7 +480,7 @@ mod test {
         let header = genesis_block.header;
         let graph = BlockGraph::from_genesis(header);
         assert_eq!(graph.blocks.len(), 1);
-        assert!(graph.next_hashes.is_empty());
+        assert_eq!(graph.next_hashes.len(), 1);
         assert_eq!(graph.tip.iter().count(), 1);
     }
 
