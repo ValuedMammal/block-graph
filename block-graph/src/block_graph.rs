@@ -41,7 +41,7 @@ impl<T: ToBlockHash + fmt::Debug + Ord + Clone> BlockGraph<T> {
     /// - `cap`: How many nodes are expected to exist in the canonical chain over the lifetime
     ///   of this BlockGraph. The BlockGraph may grow to beyond the specified `cap`, however the
     ///   performance benefits can diminish as the internal skiplist becomes more densely populated.
-    pub fn from_genesis_with_capacity(block: T, cap: usize) -> Self {
+    fn from_genesis_with_capacity(block: T, cap: usize) -> Self {
         let genesis_height = 0;
         let genesis_hash = block.to_blockhash();
 
