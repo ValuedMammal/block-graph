@@ -21,9 +21,6 @@ pub struct Node<T> {
     /// Links to the next node at every level. The length of the vector is always
     /// `level + 1`.
     pub links: Vec<Link<T>>,
-    /// The corresponding length of each link. For a given node, `links_len[level]`
-    /// tells you how many nodes are skipped by following the link at that level.
-    pub links_len: Vec<usize>,
 }
 
 impl<T> Node<T> {
@@ -34,7 +31,6 @@ impl<T> Node<T> {
             prev: None,
             level: levels - 1,
             links: vec![None; levels],
-            links_len: vec![0; levels],
         }
     }
 
@@ -45,7 +41,6 @@ impl<T> Node<T> {
             prev: None,
             level,
             links: vec![None; level + 1],
-            links_len: vec![0; level + 1],
         }
     }
 
@@ -77,7 +72,7 @@ impl<T> Node<T> {
     pub fn last(&self) -> &Self {
         (0..=self.level)
             .rev()
-            .fold(self, |node, level| node.advance_while(level, |_, _| true).0)
+            .fold(self, |node, level| node.advance_while(level, |_, _| true))
     }
 
     /// Takes the next node and returns it. The `prev` of the taken node will be set to `None`.
@@ -88,7 +83,6 @@ impl<T> Node<T> {
             self.links[0].take().map(|p| {
                 let mut next = Box::from_raw(p.as_ptr());
                 next.prev = None;
-                self.links_len[0] = 0;
                 next
             })
         }
@@ -103,7 +97,6 @@ impl<T> Node<T> {
         new_next.prev = NonNull::new(self as *mut _);
         self.links[0] = NonNull::new(Box::into_raw(new_next));
         assert!(self.next(0).is_some());
-        self.links_len[0] = 1;
 
         old_next
     }
@@ -132,22 +125,14 @@ impl<T> Node<T> {
     ///
     /// This method takes a `pred` closure which given a reference to the current and next node
     /// determines whether to advance.
-    ///
-    /// Returns a tuple `(node, distance)` representing the target node and distance moved.
-    pub fn advance_while(
-        &self,
-        level: usize,
-        mut pred: impl FnMut(&Self, &Self) -> bool,
-    ) -> (&Self, usize) {
+    pub fn advance_while(&self, level: usize, mut pred: impl FnMut(&Self, &Self) -> bool) -> &Self {
         let mut current = self;
-        let mut traveled = 0;
         loop {
             match current.next_if(level, &mut pred) {
-                Ok((node, steps)) => {
+                Ok(node) => {
                     current = node;
-                    traveled += steps;
                 }
-                Err(node) => return (node, traveled),
+                Err(node) => return node,
             }
         }
     }
@@ -161,12 +146,12 @@ impl<T> Node<T> {
         &self,
         level: usize,
         pred: impl FnOnce(&Self, &Self) -> bool,
-    ) -> Result<(&Self, usize), &Self> {
+    ) -> Result<&Self, &Self> {
         // SAFETY: ptr to `Node` is always convertible to a reference.
         let next = unsafe { self.links[level].as_ref().map(|p| p.as_ref()) };
 
         match next {
-            Some(next) if pred(self, next) => Ok((next, self.links_len[level])),
+            Some(next) if pred(self, next) => Ok(next),
             _ => Err(self),
         }
     }
@@ -174,23 +159,18 @@ impl<T> Node<T> {
     /// Continue moving at the specified `level` mutably while the predicate is true.
     ///
     /// - `pred` takes a reference to current and next node.
-    ///
-    /// Returns a tuple `(node, distance)` representing the target node and the total distance
-    /// moved.
     pub fn advance_while_mut(
         &mut self,
         level: usize,
         mut pred: impl FnMut(&Self, &Self) -> bool,
-    ) -> (&mut Self, usize) {
+    ) -> &mut Self {
         let mut current = self;
-        let mut traveled = 0;
         loop {
             match current.next_if_mut(level, &mut pred) {
-                Ok((node, steps)) => {
+                Ok(node) => {
                     current = node;
-                    traveled += steps;
                 }
-                Err(node) => return (node, traveled),
+                Err(node) => return node,
             }
         }
     }
@@ -204,59 +184,13 @@ impl<T> Node<T> {
         &mut self,
         level: usize,
         pred: impl FnOnce(&Self, &Self) -> bool,
-    ) -> Result<(&mut Self, usize), &mut Self> {
+    ) -> Result<&mut Self, &mut Self> {
         // SAFETY: ptr to `Node` is always convertible to a reference.
         let next = unsafe { self.links[level].as_mut().map(|p| p.as_mut()) };
 
         match next {
-            Some(next) if pred(self, next) => Ok((next, self.links_len[level])),
+            Some(next) if pred(self, next) => Ok(next),
             _ => Err(self),
-        }
-    }
-
-    /// Compute the distance to `target` at the specified level.
-    ///
-    /// If no target is given, return the distance from this node to the last reachable node at
-    /// level.
-    pub fn distance_at_level(&self, level: usize, target: Option<&Self>) -> Result<usize, ()> {
-        match target {
-            Some(target) => {
-                let (node, distance) = self.advance_while(level, |cur, _| !ptr::eq(cur, target));
-                if !ptr::eq(node, target) {
-                    return Err(());
-                }
-                Ok(distance)
-            }
-            None => {
-                let (node, distance) = self.advance_while(level, |_, _| true);
-                Ok(distance + node.links_len[level])
-            }
-        }
-    }
-
-    /// Move for `max_distance` steps and return a reference to the target node if it exists.
-    pub fn advance(&self, max_distance: usize) -> Option<&Self> {
-        let level = self.level;
-        let mut node = self;
-        let mut traveled = 0;
-
-        for level in (0..=level).rev() {
-            let (level_node, _) = node.advance_while(level, |cur_node, _| {
-                let step = cur_node.links_len[level];
-                if step + traveled <= max_distance {
-                    traveled += step;
-                    true
-                } else {
-                    false
-                }
-            });
-            node = level_node;
-        }
-
-        if traveled == max_distance {
-            Some(node)
-        } else {
-            None
         }
     }
 }
@@ -310,7 +244,7 @@ impl<T> Seek<T> {
         let mut cur_node = node;
 
         for level in (0..levels).rev() {
-            let (level_node, _) = cur_node
+            let level_node = cur_node
                 .advance_while(level, |_, next| next.key().map_or(true, |k| k > target_key));
             cur_node = level_node;
         }
@@ -346,22 +280,21 @@ where
         self,
         node: &mut SkipListNode<T>,
         level: usize,
-    ) -> Result<(&mut SkipListNode<T>, usize), T> {
+    ) -> Result<&mut SkipListNode<T>, T> {
         // SAFETY: `level_head` must point to a valid Node, so it is safe to dereference.
         unsafe {
-            let (level_head, distance_this_level) =
+            let level_head =
                 node.advance_while_mut(level, |_, next| next.key().map_or(true, |k| k > self.key));
             let level_head_ptr = level_head as *mut _;
             if level == 0 {
                 let node = self.insert_or_replace(level_head)?;
-                Ok((node, distance_this_level))
+                Ok(node)
             } else {
                 // Recurse at (level - 1)...
-                let (node, distance_after_head) =
-                    self.seek_and_insert_or_replace(level_head, level - 1)?;
+                let node = self.seek_and_insert_or_replace(level_head, level - 1)?;
                 let level_head = &mut *level_head_ptr;
-                Self::insertion_fixup(level, level_head, distance_after_head, node);
-                Ok((node, distance_this_level + distance_after_head))
+                Self::insertion_fixup(level, level_head, node);
+                Ok(node)
             }
         }
     }
@@ -393,7 +326,6 @@ where
     fn insertion_fixup(
         level: usize,
         level_head: &mut SkipListNode<T>,
-        distance_from_parent: usize,
         new_node: &mut SkipListNode<T>,
     ) {
         if level == 0 {
@@ -402,11 +334,6 @@ where
         if level <= new_node.level {
             new_node.links[level] = level_head.links[level];
             level_head.links[level] = NonNull::new(new_node);
-            let old_len = level_head.links_len[level];
-            new_node.links_len[level] = old_len - distance_from_parent;
-            level_head.links_len[level] = distance_from_parent + 1;
-        } else {
-            level_head.links_len[level] += 1;
         }
     }
 }
@@ -432,22 +359,21 @@ impl<T> Remove<T> {
         self,
         node: &mut SkipListNode<T>,
         level: usize,
-    ) -> Result<(Box<SkipListNode<T>>, usize), ()> {
+    ) -> Result<Box<SkipListNode<T>>, ()> {
         // SAFETY: `level_head` must point to a valid Node, so it is safe to dereference.
         unsafe {
-            let (level_head, distance_this_level) =
+            let level_head =
                 node.advance_while_mut(level, |_, next| next.key().map_or(true, |k| k > self.key));
             let level_head_ptr = level_head as *mut _;
             if level == 0 {
                 let node = self.remove(level_head)?;
-                Ok((node, distance_this_level))
+                Ok(node)
             } else {
                 // Recurse at (level - 1)...
-                let (mut node, distance_after_head) =
-                    self.seek_and_remove(level_head, level - 1)?;
+                let mut node = self.seek_and_remove(level_head, level - 1)?;
                 let level_head = &mut *level_head_ptr;
                 Self::removal_fixup(level, level_head, &mut node);
-                Ok((node, distance_this_level + distance_after_head))
+                Ok(node)
             }
         }
     }
@@ -480,9 +406,7 @@ impl<T> Remove<T> {
                 "level_head must be linked to the removed_node"
             );
             level_head.links[level] = removed_node.links[level];
-            level_head.links_len[level] += removed_node.links_len[level];
         }
-        level_head.links_len[level] -= 1;
     }
 }
 
@@ -493,40 +417,17 @@ impl<T> Node<T> {
         assert!(self.is_head());
         assert!(self.value.is_none());
         let mut cur_node = Some(self);
-        let mut len = 0;
         while let Some(node) = cur_node {
             // Check the integrity of node.
             assert_eq!(node.level + 1, node.links.len());
-            assert_eq!(node.level + 1, node.links_len.len());
             if !node.is_head() {
                 assert!(node.value.is_some());
             }
             // Check link at level 0
             if let Some(next_node) = node.next(0) {
-                len += 1;
                 assert!(ptr::eq(next_node.prev.unwrap().as_ptr(), node));
             }
             cur_node = node.next(0);
-        }
-
-        for level in 1..=self.level {
-            let mut length_sum = 0;
-            let mut cur_node = Some(self);
-            while let Some(node) = cur_node {
-                length_sum += node.links_len[level];
-                let next_node = unsafe { node.links[level].as_ref().map(|p| p.as_ref()) };
-                assert_eq!(
-                    node.links_len[level],
-                    node.distance_at_level(level - 1, next_node).unwrap(),
-                    "Node gives different distance at level {} and level {}",
-                    level,
-                    level - 1
-                );
-
-                cur_node = next_node;
-            }
-
-            assert_eq!(length_sum, len);
         }
     }
 }
@@ -609,20 +510,3 @@ impl<T> DoubleEndedIterator for SkipListIter<'_, T> {
 }
 
 impl<T> ExactSizeIterator for SkipListIter<'_, T> {}
-
-/// Node iter.
-#[derive(Debug)]
-#[allow(unused)]
-pub struct NodeIter<'a, T> {
-    current: Option<&'a Node<T>>,
-}
-
-impl<'a, T> Iterator for NodeIter<'a, T> {
-    type Item = &'a T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let node = self.current?;
-        self.current = node.next_ref();
-        node.value.as_ref()
-    }
-}

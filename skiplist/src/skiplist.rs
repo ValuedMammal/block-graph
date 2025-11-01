@@ -93,19 +93,6 @@ impl<T> SkipList<T> {
         None
     }
 
-    /// Get a reference to the node at the given `index`.
-    ///
-    /// Here index refers not to the node key, but the value of the i-th element of the collection.
-    /// Note also that since nodes are arranged in descending key order, the node at index 0 will
-    /// return the node with the highest key.
-    fn get_index(&self, index: usize) -> Option<&Node<T>> {
-        if index >= self.len {
-            return None;
-        }
-
-        self.head.advance(index + 1)
-    }
-
     /// Insert a `value` at the specified `height`.
     ///
     /// Returns `None` if a value at `height` was not present, or if the key was already present
@@ -130,7 +117,7 @@ impl<T> SkipList<T> {
         let remove = node::Remove::new(height);
         let head = self.head.as_mut();
         match remove.seek_and_remove(head, head.level) {
-            Ok((mut node, _)) => {
+            Ok(mut node) => {
                 self.len -= 1;
                 node.value.take().map(|(_k, v)| v)
             }
@@ -172,15 +159,6 @@ impl<T> SkipList<T> {
     }
 }
 
-impl<T> core::ops::Index<usize> for SkipList<T> {
-    type Output = (u32, T);
-
-    fn index(&self, index: usize) -> &Self::Output {
-        let node = self.get_index(index).expect("index out of bounds");
-        node.value.as_ref().expect("node must not be head")
-    }
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
@@ -195,23 +173,18 @@ mod test {
     fn print_skiplist<T>(node: &Node<T>) {
         for level in (0..=node.level).rev() {
             println!("\n===== Level {level} =====");
-            let (level_node, _) = node.advance_while(level, |n, _| {
+            let level_node = node.advance_while(level, |n, _| {
                 if n.value.is_none() {
                     assert!(n.is_head());
                     print!("HEAD");
                 } else {
                     let key = n.key().unwrap();
-                    let dist = n.links_len[level];
-                    print!(" - K[{key}] d({dist})");
+                    print!(" - [{key}]");
                 }
                 true
             });
             if level_node.value.is_some() {
-                print!(
-                    " - K[{}] d({})",
-                    level_node.key().unwrap(),
-                    level_node.links_len[level]
-                );
+                print!(" - [{}]", level_node.key().unwrap(),);
             }
         }
         println!();
@@ -341,36 +314,5 @@ mod test {
 
         let missing_height = exp_len as u32;
         assert!(skiplist.remove(missing_height).is_none());
-    }
-
-    #[test]
-    fn test_skiplist_index() {
-        let mut skiplist = SkipList::<i32>::with_capacity(100);
-
-        assert!(skiplist.get_index(0).is_none());
-
-        // Insert 10 values
-        for key in 0..10 {
-            let value = 1 << (key as i32);
-            skiplist.insert(key, value);
-        }
-
-        assert_eq!(skiplist.len(), 10);
-
-        // Index operation should not panic
-        for test_index in 0..10 {
-            let _value = skiplist[test_index];
-        }
-
-        assert!(skiplist.get_index(skiplist.len).is_none());
-    }
-
-    #[test]
-    #[should_panic(expected = "index out of bounds")]
-    fn test_skiplist_index_out_of_bounds() {
-        let skiplist = SkipList::<i32>::with_capacity(100);
-        assert!(skiplist.is_empty());
-
-        let _no_value = skiplist[0];
     }
 }
