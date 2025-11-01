@@ -213,6 +213,17 @@ impl<V> SkipListNode<V> {
     pub fn value_mut(&mut self) -> Option<&mut V> {
         self.value.as_mut().map(|(_, v)| v)
     }
+
+    /// Advance to the last node of `level` having a key greater or equal to the search `key`.
+    pub fn last_ge(&self, level: usize, key: u32) -> &Self {
+        self.advance_while(level, |_, next| next.key().map_or(true, |k| k > key))
+    }
+
+    /// Advance to the last node of `level` (mutably) having a key greater or equal to the
+    /// search `key`.
+    pub fn last_ge_mut(&mut self, level: usize, key: u32) -> &mut Self {
+        self.advance_while_mut(level, |_, next| next.key().map_or(true, |k| k > key))
+    }
 }
 
 /// Type used to quickly search for a value in `SkipList`.
@@ -238,18 +249,14 @@ impl<T> Seek<T> {
     /// traversing at lower levels without overshooting the target.
     ///
     /// [`next_ref`]: Node::next_ref
-    pub fn seek<'a>(&self, node: &'a SkipListNode<T>) -> &'a SkipListNode<T> {
-        let target_key = self.key;
+    pub fn seek<'a>(&self, mut node: &'a SkipListNode<T>) -> &'a SkipListNode<T> {
         let levels = node.level;
-        let mut cur_node = node;
 
         for level in (0..levels).rev() {
-            let level_node = cur_node
-                .advance_while(level, |_, next| next.key().map_or(true, |k| k > target_key));
-            cur_node = level_node;
+            node = node.last_ge(level, self.key);
         }
 
-        cur_node
+        node
     }
 }
 
@@ -283,12 +290,10 @@ where
     ) -> Result<&mut SkipListNode<T>, T> {
         // SAFETY: `level_head` must point to a valid Node, so it is safe to dereference.
         unsafe {
-            let level_head =
-                node.advance_while_mut(level, |_, next| next.key().map_or(true, |k| k > self.key));
+            let level_head = node.last_ge_mut(level, self.key);
             let level_head_ptr = level_head as *mut _;
             if level == 0 {
-                let node = self.insert_or_replace(level_head)?;
-                Ok(node)
+                self.insert_or_replace(level_head)
             } else {
                 // Recurse at (level - 1)...
                 let node = self.seek_and_insert_or_replace(level_head, level - 1)?;
@@ -362,12 +367,10 @@ impl<T> Remove<T> {
     ) -> Result<Box<SkipListNode<T>>, ()> {
         // SAFETY: `level_head` must point to a valid Node, so it is safe to dereference.
         unsafe {
-            let level_head =
-                node.advance_while_mut(level, |_, next| next.key().map_or(true, |k| k > self.key));
+            let level_head = node.last_ge_mut(level, self.key);
             let level_head_ptr = level_head as *mut _;
             if level == 0 {
-                let node = self.remove(level_head)?;
-                Ok(node)
+                self.remove(level_head)
             } else {
                 // Recurse at (level - 1)...
                 let mut node = self.seek_and_remove(level_head, level - 1)?;
