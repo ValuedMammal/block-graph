@@ -100,8 +100,7 @@ impl<T> SkipList<T> {
     pub fn insert(&mut self, height: u32, value: T) -> Option<T> {
         let level = self.level();
 
-        let insert =
-            node::InsertOrReplace::new(height, value, |k, v| Box::new(Node::new((k, v), level)));
+        let insert = node::Insert::new(height, value, |k, v| Box::new(Node::new((k, v), level)));
         let head = self.head.as_mut();
         match insert.seek_and_insert_or_replace(head, head.level) {
             Ok(..) => {

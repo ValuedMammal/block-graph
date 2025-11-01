@@ -261,17 +261,17 @@ impl<T> Seek<T> {
 }
 
 /// Type used for inserting values into `SkipList`.
-pub struct InsertOrReplace<T, F> {
+pub struct Insert<T, F> {
     key: u32,
     value: T,
     make_node: F,
 }
 
-impl<T, F> InsertOrReplace<T, F>
+impl<T, F> Insert<T, F>
 where
     F: FnOnce(u32, T) -> Box<SkipListNode<T>>,
 {
-    /// Create new [`InsertOrReplace`] with the given `key`, `value`, and `make_node` fn.
+    /// Create new [`Insert`] with the given `key`, `value`, and `make_node` fn.
     pub fn new(key: u32, value: T, make_node: F) -> Self {
         Self {
             key,
