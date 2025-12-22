@@ -19,7 +19,7 @@ type Node<T> = node::Node<(u32, T)>;
 #[derive(Debug)]
 pub struct SkipList<T> {
     head: Box<Node<T>>,
-    levels: usize,
+    max_level: usize,
     len: usize,
     rng: ThreadRng,
 }
@@ -42,14 +42,14 @@ impl<T> SkipList<T> {
     /// It is possible for the skiplist to grow beyond the specified `cap`, but the supposed
     /// performance benefits can diminish as higher levels become more densely populated.
     pub fn with_capacity(cap: usize) -> Self {
-        let levels = core::cmp::max(1, (cap as f64).log2().round() as usize);
-        let head = Box::new(Node::new_head(levels));
+        let max_level = core::cmp::max(1, (cap as f64).log2().round() as usize);
+        let head = Box::new(Node::new_head(max_level));
         let len = 0;
         let rng = rand::thread_rng();
 
         Self {
             head,
-            levels,
+            max_level,
             len,
             rng,
         }
@@ -73,7 +73,7 @@ impl<T> SkipList<T> {
     fn level(&mut self) -> usize {
         let mut level = 0;
         let p = 0.5;
-        while level + 1 < self.levels {
+        while level + 1 < self.max_level {
             if !self.rng.gen_bool(p) {
                 break;
             }
