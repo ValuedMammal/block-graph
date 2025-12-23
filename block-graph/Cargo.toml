@@ -2,7 +2,7 @@
 name = "block_graph"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.63.0"
+rust-version = "1.85.0"
 readme = "README.md"
 
 [dependencies]

@@ -216,13 +216,13 @@ impl<V> SkipListNode<V> {
 
     /// Advance to the last node of `level` having a key greater or equal to the search `key`.
     pub fn last_ge(&self, level: usize, key: u32) -> &Self {
-        self.advance_while(level, |_, next| next.key().map_or(true, |k| k > key))
+        self.advance_while(level, |_, next| next.key().is_none_or(|k| k > key))
     }
 
     /// Advance to the last node of `level` (mutably) having a key greater or equal to the
     /// search `key`.
     pub fn last_ge_mut(&mut self, level: usize, key: u32) -> &mut Self {
-        self.advance_while_mut(level, |_, next| next.key().map_or(true, |k| k > key))
+        self.advance_while_mut(level, |_, next| next.key().is_none_or(|k| k > key))
     }
 }
 
