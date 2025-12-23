@@ -6,7 +6,7 @@ rust-version = "1.85.0"
 readme = "README.md"
 
 [dependencies]
-bdk_chain = { git = "https://github.com/bitcoindevkit/bdk", rev = "126ebda443baebe4886a16e397d76270ac7c21d7" }
+bdk_chain = { git = "https://github.com/bitcoindevkit/bdk", rev = "be356d5fda56ca01d3540d767e1566559092c4d0" }
 serde = { version = "1", default-features = false, features = ["derive"], optional = true }
 skiplist = { path = "../skiplist", version = "0.1.0" }
 
