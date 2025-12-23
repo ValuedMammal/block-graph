@@ -290,6 +290,38 @@ impl<T: Debug + Clone + PartialEq> PartialEq for BlockGraph<T> {
     }
 }
 
+impl<T: ToBlockHash + Debug + Ord + Clone> ChainOracle for BlockGraph<T> {
+    type Error = core::convert::Infallible;
+
+    fn get_chain_tip(&self) -> Result<BlockId, Self::Error> {
+        Ok(self.tip())
+    }
+
+    fn is_block_in_chain(
+        &self,
+        block: BlockId,
+        chain_tip: BlockId,
+    ) -> Result<Option<bool>, Self::Error> {
+        // `block` height must be within that of `chain_tip`.
+        if block.height > chain_tip.height {
+            return Ok(None);
+        }
+        // `chain_tip` must exist in chain.
+        if self
+            .tip
+            .get(chain_tip.height)
+            .is_none_or(|data| data.to_blockhash() != chain_tip.hash)
+        {
+            return Ok(None);
+        }
+        // A block of given height must exist in this chain, and the hashes must match.
+        match self.tip.get(block.height) {
+            Some(data) => Ok(Some(data.to_blockhash() == block.hash)),
+            None => Ok(None),
+        }
+    }
+}
+
 /// Change set.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(
@@ -812,6 +844,62 @@ mod test {
 
         let _ = graph.apply_update(tip).unwrap();
         assert_eq!(graph.tip(), block_1a);
+    }
+
+    #[test]
+    fn test_is_block_in_chain() {
+        let genesis_block = BlockId {
+            height: 0,
+            hash: Hash::hash(b"0"),
+        };
+        let block_1 = BlockId {
+            height: 1,
+            hash: Hash::hash(b"1"),
+        };
+        let block_2 = BlockId {
+            height: 2,
+            hash: Hash::hash(b"2"),
+        };
+        let changeset = ChangeSet {
+            blocks: [
+                (genesis_block, (genesis_block.hash, [BlockId::default()].into())),
+                (block_1, (block_1.hash, [genesis_block].into())),
+                (block_2, (block_2.hash, [block_1].into())),
+            ]
+            .into(),
+        };
+        let graph = BlockGraph::from_changeset(changeset).unwrap().unwrap();
+        let chain_tip = graph.tip();
+        assert_eq!(chain_tip, block_2);
+        for block in [genesis_block, block_1, block_2] {
+            assert!(matches!(graph.is_block_in_chain(block, graph.tip()), Ok(Some(true))))
+        }
+        assert!(
+            matches!(
+                graph.is_block_in_chain(
+                    BlockId {
+                        height: 2,
+                        hash: Hash::hash(b"2a")
+                    },
+                    chain_tip
+                ),
+                Ok(Some(false))
+            ),
+            "block of wrong hash cannot be in chain"
+        );
+        assert!(
+            graph
+                .is_block_in_chain(
+                    BlockId {
+                        height: 3,
+                        hash: Hash::hash(b"3")
+                    },
+                    chain_tip
+                )
+                .unwrap()
+                .is_none(),
+            "block height past tip cannot be in chain"
+        );
     }
 
     #[test]
