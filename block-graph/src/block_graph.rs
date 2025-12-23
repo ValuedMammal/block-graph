@@ -4,13 +4,14 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 use core::fmt;
+use core::fmt::Debug;
 use core::ops::RangeBounds;
 
 use bdk_chain::{
-    bitcoin, local_chain::MissingGenesisError, BlockId, CheckPoint, Merge, ToBlockHash,
+    bitcoin, local_chain::MissingGenesisError, BlockId, ChainOracle, CheckPoint, Merge, ToBlockHash,
 };
 use bitcoin::{hashes::Hash, BlockHash};
-use skiplist::SkipList;
+use skiplist::{SkipList, SkipListIter};
 
 use crate::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -26,11 +27,11 @@ pub struct BlockGraph<T> {
     next_hashes: HashMap<BlockHash, HashSet<BlockHash>>,
     /// The root hash, aka genesis.
     root: BlockHash,
-    /// The canonical chain tip.
+    /// The canonical list of blocks in the chain.
     tip: SkipList<T>,
 }
 
-impl<T: ToBlockHash + fmt::Debug + Ord + Clone> BlockGraph<T> {
+impl<T: ToBlockHash + Debug + Ord + Clone> BlockGraph<T> {
     /// From genesis `block` with the default capacity.
     pub fn from_genesis(block: T) -> Self {
         Self::from_genesis_with_capacity(block, DEFAULT_CAPACITY)
@@ -76,7 +77,7 @@ impl<T: ToBlockHash + fmt::Debug + Ord + Clone> BlockGraph<T> {
     }
 
     /// Iterate items of the canonical chain.
-    pub fn iter(&self) -> impl Iterator<Item = &(u32, T)> {
+    pub fn iter(&self) -> SkipListIter<'_, (u32, T)> {
         self.tip.iter()
     }
 
@@ -112,7 +113,7 @@ impl<T: ToBlockHash + fmt::Debug + Ord + Clone> BlockGraph<T> {
         if changeset.blocks.is_empty() {
             return Ok(None);
         }
-        let (_, (genesis_data, _par)) = changeset
+        let (_, (genesis_data, _)) = changeset
             .blocks
             .iter()
             .find(|(id, _)| id.height == 0)
@@ -130,11 +131,11 @@ impl<T: ToBlockHash + fmt::Debug + Ord + Clone> BlockGraph<T> {
             .collect();
 
         // First fill in block nodes and next_hashes.
-        for (block_id, (block, parents)) in changeset.blocks {
+        for (block_id, (data, parents)) in changeset.blocks {
             let BlockId { height, hash } = block_id;
-            graph.blocks.insert(hash, (height, block));
-            for par in parents {
-                graph.next_hashes.entry(par.hash).or_default().insert(hash);
+            graph.blocks.insert(hash, (height, data));
+            for parent in parents {
+                graph.next_hashes.entry(parent.hash).or_default().insert(hash);
             }
         }
 
@@ -176,12 +177,12 @@ impl<T: ToBlockHash + fmt::Debug + Ord + Clone> BlockGraph<T> {
         let mut cur = Some(best_block.hash);
         while let Some(hash) = cur {
             // Get block data from graph.
-            let (height, block_data) = match graph.blocks.get(&hash).cloned() {
+            let (height, data) = match graph.blocks.get(&hash).cloned() {
                 Some(value) => value,
                 None => break,
             };
             // Insert data into tip.
-            graph.tip.insert(height, block_data);
+            graph.tip.insert(height, data);
             // Get next parent hash.
             cur = prev_hashes.get(&(height, hash).into()).copied();
         }
@@ -193,12 +194,11 @@ impl<T: ToBlockHash + fmt::Debug + Ord + Clone> BlockGraph<T> {
     /// an empty [`BlockGraph`].
     pub fn initial_changeset(&self) -> ChangeSet<T> {
         let mut changeset = ChangeSet::default();
-        let blocks = &mut changeset.blocks;
 
-        for (par_hash, extends) in &self.next_hashes {
+        for (parent_hash, extends) in &self.next_hashes {
             // Include the genesis entry, but avoid fetching a non-existing parent.
-            if *par_hash == BlockHash::all_zeros() {
-                blocks.insert(
+            if *parent_hash == BlockHash::all_zeros() {
+                changeset.blocks.insert(
                     BlockId {
                         height: 0,
                         hash: self.root,
@@ -208,18 +208,19 @@ impl<T: ToBlockHash + fmt::Debug + Ord + Clone> BlockGraph<T> {
                 continue;
             }
 
-            let par_id = self.block_id(par_hash).expect("invariant");
+            let parent = self.block_id(parent_hash).expect("invariant");
 
             for &hash in extends {
                 // Get the orginal block corresponding to `hash`.
                 let (height, block) = self.blocks.get(&hash).cloned().expect("invariant");
                 let id = BlockId { height, hash };
-                blocks
+                changeset
+                    .blocks
                     .entry(id)
                     .and_modify(|(_, p)| {
-                        p.insert(par_id);
+                        p.insert(parent);
                     })
-                    .or_insert((block, [par_id].into()));
+                    .or_insert((block, [parent].into()));
             }
         }
 
@@ -231,14 +232,33 @@ impl<T: ToBlockHash + fmt::Debug + Ord + Clone> BlockGraph<T> {
     where
         T: ToBlockHash + Copy,
     {
-        let (changeset, disconnections) = self.merge_chains(tip)?;
+        self.apply_update_connected_to(
+            tip.iter()
+                .map(|cp| (cp.height(), cp.data(), cp.prev().map(|cp| cp.block_id()))),
+        )
+    }
+
+    /// Applies an iterable of update blocks.
+    ///
+    /// Items of `blocks` represent the block height, block data, and block ID
+    /// which the update connects to.
+    pub fn apply_update_connected_to<I>(
+        &mut self,
+        blocks: I,
+    ) -> Result<ChangeSet<T>, CannotConnectError>
+    where
+        I: IntoIterator<Item = (u32, T, Option<BlockId>)>,
+        T: ToBlockHash + Copy,
+    {
+        let (changeset, disconnections) = self.merge_chains(blocks.into_iter())?;
 
         self.apply_changeset(changeset.clone(), disconnections);
 
         Ok(changeset)
     }
 
-    /// Apply changeset. This must not fail!
+    /// Apply changeset. This is infallible because it's only called after `merge_chains`
+    /// succeeds.
     fn apply_changeset(&mut self, changeset: ChangeSet<T>, disconnections: Vec<BlockId>) {
         // First add blocks to graph.
         for (id, (block, parents)) in changeset.blocks.clone().into_iter() {
@@ -261,7 +281,7 @@ impl<T: ToBlockHash + fmt::Debug + Ord + Clone> BlockGraph<T> {
     }
 }
 
-impl<T: fmt::Debug + Clone + PartialEq> PartialEq for BlockGraph<T> {
+impl<T: Debug + Clone + PartialEq> PartialEq for BlockGraph<T> {
     fn eq(&self, other: &Self) -> bool {
         self.blocks == other.blocks
             && self.next_hashes == other.next_hashes
@@ -306,7 +326,7 @@ impl<T: Default + Ord> Merge for ChangeSet<T> {
 
 impl<T> BlockGraph<T>
 where
-    T: ToBlockHash + fmt::Debug + Ord + Copy,
+    T: ToBlockHash + Debug + Ord + Copy,
 {
     /// Get blocks of the canonical chain as a single [`CheckPoint`].
     ///
@@ -339,88 +359,74 @@ where
     ///
     /// Returns a [`CannotConnectError`] if the chains don't connect, for example if there is
     /// no point of agreement (and no reorg occurred).
-    fn merge_chains(
-        &self,
-        update: CheckPoint<T>,
-    ) -> Result<(ChangeSet<T>, Vec<BlockId>), CannotConnectError> {
-        // Create an iterator that visits every item as a CheckPoint,
-        // noting this is somewhat of a hack since checkpoints of the original
-        // tip are not linked to one another via their `prev`.
-        let mut original_tip = self
-            .tip
-            .iter()
-            .map(|&(height, value)| CheckPoint::new(height, value))
-            .peekable();
-        let mut update_tip = update.iter().peekable();
+    fn merge_chains<I>(&self, update: I) -> Result<(ChangeSet<T>, Vec<BlockId>), CannotConnectError>
+    where
+        I: Iterator<Item = (u32, T, Option<BlockId>)>,
+    {
+        let mut original_tip = self.tip.iter().cloned().peekable();
+        let mut update_tip = update.peekable();
 
         let mut point_of_agreement = None;
         let mut is_prev_orig_invalid = false;
         let mut potentially_invalid_blocks = vec![];
 
-        // The changes to be applied if merging the chains succeeds.
-        let mut blocks: BTreeMap<BlockId, (T, BTreeSet<BlockId>)> = BTreeMap::new();
+        let mut changeset = ChangeSet::default();
 
         loop {
             match (original_tip.peek(), update_tip.peek()) {
-                // We're done when all updates have been processed.
-                (_, None) => break,
-                (_, Some(update)) if update.height() == 0 => {
-                    if update.hash() != self.root {
+                // We're done when all updates are processed.
+                (_original, None) => break,
+                // Error if attempting to overwrite the genesis hash.
+                (_, Some(&(update_height, update, _))) if update_height == 0 => {
+                    if update.to_blockhash() != self.root {
                         return Err(CannotConnectError(0));
                     }
-                    point_of_agreement = Some(0);
+                    point_of_agreement = Some(update_height);
                     break;
                 }
-                (Some(original), Some(update)) => {
-                    // To find a suitable parent of the update block, we need to consider
-                    // two scenarios:
-                    //
-                    // 1. The checkpoint has a `prev`.
-                    // 2. The checkpoint is "unrooted", in which case we need to locate the next
-                    //    nearest block of the *original chain* that sits at a lower height than the
-                    //    update block.
-                    let par_id = match update.prev() {
-                        Some(prev) => prev.block_id(),
-                        None => {
-                            debug_assert!(update.height() > 0, "`tip.range` must not underflow");
-                            self.tip
-                                .range(..update.height())
-                                .next()
-                                .map(|&(height, block)| BlockId {
-                                    height,
-                                    hash: block.to_blockhash(),
-                                })
-                                .expect("range is non-empty")
-                        }
-                    };
-                    // Now we compare heights.
-                    match update.height().cmp(&original.height()) {
+                (Some(original), Some(&(update_height, update, parent))) => {
+                    assert!(update_height > 0, "must have non-zero update height");
+                    let parent = parent.unwrap_or_else(|| {
+                        self.range(0..update_height)
+                            .next()
+                            .map(|&(height, data)| BlockId {
+                                height,
+                                hash: data.to_blockhash(),
+                            })
+                            .expect("range must be non-empty")
+                    });
+                    let (height, data) = *original;
+                    let original_hash = data.to_blockhash();
+                    let block_id = (height, original_hash).into();
+                    let update_hash = update.to_blockhash();
+                    let update_block_id = (update_height, update_hash).into();
+
+                    match update_height.cmp(&height) {
                         // Update height that is not in original.
                         Ordering::Greater => {
-                            blocks.insert(update.block_id(), (update.data(), [par_id].into()));
+                            changeset.blocks.insert(update_block_id, (update, [parent].into()));
                             update_tip.next();
                         }
                         // Original height not in update.
                         Ordering::Less => {
-                            potentially_invalid_blocks.push(original.block_id());
+                            potentially_invalid_blocks.push(block_id);
                             is_prev_orig_invalid = false;
                             original_tip.next();
                         }
                         Ordering::Equal => {
                             // Compare block hashes.
-                            if update.hash() == original.hash() {
-                                point_of_agreement = Some(original.height());
+                            if update_hash == original_hash {
+                                point_of_agreement = Some(height);
                                 // We may be adding an edge if the parent doesn't exist in graph.
-                                if !self.blocks.contains_key(&par_id.hash) {
-                                    blocks.insert(
-                                        update.block_id(),
-                                        (update.data(), [par_id].into()),
-                                    );
+                                if !self.blocks.contains_key(&parent.hash) {
+                                    changeset
+                                        .blocks
+                                        .insert(update_block_id, (update, [parent].into()));
                                 }
                             } else {
-                                potentially_invalid_blocks.push(original.block_id());
+                                potentially_invalid_blocks.push(block_id);
                                 is_prev_orig_invalid = true;
-                                blocks.insert(update.block_id(), (update.data(), [par_id].into()));
+                                changeset.blocks.insert(update_block_id, (update, [parent].into()));
                             }
                             original_tip.next();
                             update_tip.next();
@@ -448,7 +454,7 @@ where
             vec![]
         };
 
-        Ok((ChangeSet { blocks }, disconnections))
+        Ok((changeset, disconnections))
     }
 }
 
@@ -663,7 +669,11 @@ mod test {
             hash: Hash::hash(b"1"),
         };
         let update = CheckPoint::new(block_1.height, block_1.hash);
-        let res = graph.merge_chains(update);
+        let res = graph.merge_chains(
+            update
+                .iter()
+                .map(|cp| (cp.height(), cp.data(), cp.prev().map(|cp| cp.block_id()))),
+        );
         assert!(matches!(
             res,
             Err(CannotConnectError(height)) if height == 2,
@@ -735,7 +745,12 @@ mod test {
         };
         tip = tip.insert(1, block_1a.hash);
 
-        let (changeset, disconnections) = graph.merge_chains(tip.clone()).unwrap();
+        let (changeset, disconnections) = graph
+            .merge_chains(
+                tip.iter()
+                    .map(|cp| (cp.height(), cp.data(), cp.prev().map(|cp| cp.block_id()))),
+            )
+            .unwrap();
         assert_eq!(
             changeset.blocks,
             [(block_1a, (block_1a.hash, [genesis_block].into()))].into()
@@ -783,7 +798,12 @@ mod test {
         };
         tip = tip.insert(1, block_1a.hash);
 
-        let (changeset, disconnections) = graph.merge_chains(tip.clone()).unwrap();
+        let (changeset, disconnections) = graph
+            .merge_chains(
+                tip.iter()
+                    .map(|cp| (cp.height(), cp.data(), cp.prev().map(|cp| cp.block_id()))),
+            )
+            .unwrap();
         assert_eq!(
             changeset.blocks,
             [(block_1a, (block_1a.hash, [genesis_block].into()))].into()
