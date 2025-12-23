@@ -9,7 +9,7 @@ use core::ptr::NonNull;
 
 type Link<T> = Option<NonNull<Node<T>>>;
 
-/// A node in the SkipList.
+/// A node in the skiplist.
 #[derive(Debug)]
 pub struct Node<T> {
     /// The value stored in the node, will be `None` for the head node.
@@ -94,7 +94,7 @@ impl<T> Node<T> {
         if let Some(old_next) = old_next.as_mut() {
             old_next.prev = None;
         }
-        new_next.prev = NonNull::new(self as *mut _);
+        new_next.prev = NonNull::new(ptr::from_mut(self));
         self.links[0] = NonNull::new(Box::into_raw(new_next));
         assert!(self.next(0).is_some());
 
@@ -195,7 +195,7 @@ impl<T> Node<T> {
     }
 }
 
-/// Alias for a node in the [`SkipList`](super::SkipList).
+/// Alias for a node in the [`SkipList`](crate::SkipList).
 type SkipListNode<V> = Node<(u32, V)>;
 
 impl<V> SkipListNode<V> {
@@ -327,7 +327,7 @@ where
 
     /// Fixes links of the specified `level` after insertion.
     ///
-    /// Places the new node after `level_head` (if `level` is within that of the new_node).
+    /// Places the new node after `level_head` (if `level` is within that of the `new_node`).
     fn insertion_fixup(
         level: usize,
         level_head: &mut SkipListNode<T>,
@@ -444,7 +444,7 @@ impl<T> Drop for Node<T> {
     }
 }
 
-/// An iterator for SkipList allowing both forwards and backwards iteration.
+/// An iterator for [`SkipList`](crate::SkipList) allowing both forwards and backwards iteration.
 #[derive(Debug)]
 pub struct SkipListIter<'a, T> {
     first: Option<&'a Node<T>>,
@@ -480,7 +480,7 @@ impl<'a, T> Iterator for SkipListIter<'a, T> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let cur_node = self.first?;
-        if ptr::eq(cur_node, self.last.map_or(ptr::null(), |v| v as *const _)) {
+        if ptr::eq(cur_node, self.last.map_or(ptr::null(), ptr::from_ref)) {
             self.first = None;
             self.last = None;
         } else {
@@ -498,7 +498,7 @@ impl<'a, T> Iterator for SkipListIter<'a, T> {
 impl<T> DoubleEndedIterator for SkipListIter<'_, T> {
     fn next_back(&mut self) -> Option<Self::Item> {
         let last_node = self.last?;
-        if ptr::eq(last_node, self.first.map_or(ptr::null(), |v| v as *const _)) {
+        if ptr::eq(last_node, self.first.map_or(ptr::null(), ptr::from_ref)) {
             self.first = None;
             self.last = None;
         } else {

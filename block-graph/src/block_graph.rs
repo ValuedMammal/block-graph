@@ -40,7 +40,7 @@ impl<T: ToBlockHash + Debug + Ord + Clone> BlockGraph<T> {
     /// From genesis `block` with the given capacity.
     ///
     /// - `cap`: How many nodes are expected to exist in the canonical chain over the lifetime
-    ///   of this BlockGraph. The BlockGraph may grow to beyond the specified `cap`, however the
+    ///   of this `BlockGraph`. The `BlockGraph` may grow to beyond the specified `cap`, however the
     ///   performance benefits can diminish as the internal skiplist becomes more densely populated.
     fn from_genesis_with_capacity(block: T, cap: usize) -> Self {
         let genesis_height = 0;
@@ -127,7 +127,7 @@ impl<T: ToBlockHash + Debug + Ord + Clone> BlockGraph<T> {
         let prev_hashes: HashMap<BlockId, BlockHash> = changeset
             .blocks
             .iter()
-            .flat_map(|(id, (_, parents))| Some((*id, parents.iter().last().map(|id| id.hash)?)))
+            .filter_map(|(id, (_, parents))| Some((*id, parents.iter().last().map(|id| id.hash)?)))
             .collect();
 
         // First fill in block nodes and next_hashes.
@@ -160,15 +160,12 @@ impl<T: ToBlockHash + Debug + Ord + Clone> BlockGraph<T> {
         // block hashes, as it implies more work.
         let best_block = tips
             .iter()
-            .flat_map(|hash| graph.block_id(hash))
+            .filter_map(|hash| graph.block_id(hash))
             .max_by_key(|b| (b.height, core::cmp::Reverse(b.hash)));
 
-        let best_block = match best_block {
-            Some(b) => b,
-            None => {
-                debug_assert!(false, "failed to find best tip");
-                return Ok(None);
-            }
+        let Some(best_block) = best_block else {
+            debug_assert!(false, "failed to find best tip");
+            return Ok(None);
         };
 
         // Now that we know the tip we need to populate the canonical chain
@@ -208,6 +205,7 @@ impl<T: ToBlockHash + Debug + Ord + Clone> BlockGraph<T> {
                 continue;
             }
 
+            // TODO: This might not be invariant?
             let parent = self.block_id(parent_hash).expect("invariant");
 
             for &hash in extends {
@@ -228,6 +226,8 @@ impl<T: ToBlockHash + Debug + Ord + Clone> BlockGraph<T> {
     }
 
     /// Apply update.
+    ///
+    /// # Errors
     pub fn apply_update(&mut self, tip: CheckPoint<T>) -> Result<ChangeSet<T>, CannotConnectError>
     where
         T: ToBlockHash + Copy,
@@ -261,7 +261,7 @@ impl<T: ToBlockHash + Debug + Ord + Clone> BlockGraph<T> {
     /// succeeds.
     fn apply_changeset(&mut self, changeset: ChangeSet<T>, disconnections: Vec<BlockId>) {
         // First add blocks to graph.
-        for (id, (block, parents)) in changeset.blocks.clone().into_iter() {
+        for (id, (block, parents)) in changeset.blocks.clone() {
             let BlockId { height, hash } = id;
             self.blocks.insert(hash, (height, block.clone()));
             for par in parents {
@@ -395,7 +395,7 @@ where
     where
         I: Iterator<Item = (u32, T, Option<BlockId>)>,
     {
-        let mut original_tip = self.tip.iter().cloned().peekable();
+        let mut original_tip = self.tip.iter().copied().peekable();
         let mut update_tip = update.peekable();
 
         let mut point_of_agreement = None;
@@ -476,7 +476,7 @@ where
         // were reorged.
         if point_of_agreement.is_none() && !is_prev_orig_invalid {
             let try_height =
-                potentially_invalid_blocks.last().cloned().unwrap_or(self.tip()).height;
+                potentially_invalid_blocks.last().copied().unwrap_or(self.tip()).height;
             return Err(CannotConnectError(try_height));
         }
 

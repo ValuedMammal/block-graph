@@ -158,6 +158,15 @@ impl<T> SkipList<T> {
     }
 }
 
+impl<'a, T> IntoIterator for &'a SkipList<T> {
+    type Item = &'a (u32, T);
+    type IntoIter = node::SkipListIter<'a, (u32, T)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
