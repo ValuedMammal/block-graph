@@ -21,22 +21,16 @@ fn bench_from_changeset(changeset: ChangeSet<BlockHash>) {
 
 fn from_changeset(c: &mut Criterion) {
     let mut changeset = block_graph::ChangeSet::default();
-    let blocks = &mut changeset.blocks;
 
-    let mut par_id = BlockId::default();
+    let mut parent_hash = BlockHash::all_zeros();
 
     for i in 0..CT {
         let height = i as u32;
         let hash = Hash::hash(height.to_be_bytes().as_slice());
-        let id = BlockId { height, hash };
-        blocks
-            .entry(id)
-            .and_modify(|(_, p)| {
-                p.insert(par_id);
-            })
-            .or_insert((hash, [par_id].into()));
+        let block_id = BlockId { height, hash };
+        changeset.blocks.insert((block_id, hash, parent_hash));
         // update next parent id.
-        par_id = BlockId { height, hash };
+        parent_hash = hash;
     }
 
     c.bench_function("from_changeset", move |b| {
