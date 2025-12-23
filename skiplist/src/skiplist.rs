@@ -134,12 +134,12 @@ impl<T> SkipList<T> {
         use core::ops::Bound;
         let start: u32 = match range.start_bound().cloned() {
             Bound::Included(k) => k,
-            Bound::Excluded(k) => k + 1,
+            Bound::Excluded(k) => k.saturating_add(1),
             Bound::Unbounded => u32::MIN,
         };
         let end: u32 = match range.end_bound().cloned() {
             Bound::Included(k) => k,
-            Bound::Excluded(k) => k - 1,
+            Bound::Excluded(k) => k.saturating_sub(1),
             Bound::Unbounded => u32::MAX,
         };
 
