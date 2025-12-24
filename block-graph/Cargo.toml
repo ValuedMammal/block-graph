@@ -24,3 +24,7 @@ criterion = "0.2"
 [[bench]]
 name = "from_changeset"
 harness = false
+
+[[bench]]
+name = "canonical_view"
+harness = false
