@@ -22,6 +22,10 @@ path = "."
 criterion = "0.2"
 
 [[bench]]
+name = "block_graph_checkpoint"
+harness = false
+
+[[bench]]
 name = "from_changeset"
 harness = false
 
