@@ -9,12 +9,37 @@ use core::ops::RangeBounds;
 // TODO:
 // - Implement Node::ksip
 // - Improve `get` efficiency
-// - Add Node::index which stores the numerical index of a checkpoint
-// - Change to `get_skip_index`, since in a "sparse" chain we can't assume all heights are present
+// - Add Node::index that stores the numerical index of a checkpoint starting from 0
+// - Change to `get_skip_index` (instead of height), since in a "sparse" chain we can't assume that all heights are present
 
 /// CheckPoint, guaranteed to have at least 1 element.
 #[derive(Debug)]
 pub struct CheckPoint<T>(pub(crate) Arc<Node<T>>);
+
+/// Node containing both a key and value. The key is referred to as `height`.
+#[derive(Debug)]
+pub(crate) struct Node<T> {
+    pub height: u32,
+    pub value: T,
+    pub prev: Option<Arc<Node<T>>>,
+    // pointer to a Node further back
+    pub skip: Option<Arc<Node<T>>>,
+    pub index: usize,
+}
+
+impl<T> Drop for Node<T> {
+    fn drop(&mut self) {
+        let mut current = self.prev.take();
+        while let Some(node) = current {
+            match Arc::into_inner(node) {
+                Some(mut node) => {
+                    current = node.prev.take();
+                }
+                None => break,
+            }
+        }
+    }
+}
 
 impl<T> CheckPoint<T>
 where
@@ -27,6 +52,7 @@ where
             value,
             prev: None,
             skip: None,
+            index: 0,
         }))
     }
 
@@ -62,10 +88,12 @@ where
             return Err(self);
         }
 
-        // Calculate skip pointer before creating the node
+        let new_index = self.0.index + 1;
+
+        // Calculate skip pointer using index-based logic
         let skip = {
-            let skip_height = get_skip_height(height);
-            self.get(skip_height).map(|cp| cp.0)
+            let skip_index = get_skip_index(new_index);
+            self.get_index(skip_index).map(|cp| cp.0)
         };
 
         let node = Node {
@@ -73,6 +101,7 @@ where
             value,
             prev: Some(self.0),
             skip,
+            index: new_index,
         };
 
         Ok(Self(Arc::new(node)))
@@ -134,6 +163,11 @@ where
         self.0.skip.clone().map(Self)
     }
 
+    /// Get the current index of this checkpoint.
+    pub fn index(&self) -> usize {
+        self.0.index
+    }
+
     /// Whether `self` and `other` share the same underlying pointer.
     pub fn eq_ptr(&self, other: &Self) -> bool {
         Arc::as_ptr(&self.0) == Arc::as_ptr(&other.0)
@@ -143,6 +177,50 @@ where
     pub fn iter(&self) -> CheckPointIter<T> {
         CheckPointIter {
             cur: Some(self.0.clone()),
+        }
+    }
+
+    /// Get the checkpoint at a given index.
+    pub fn get_index(&self, target_index: usize) -> Option<Self> {
+        if target_index > self.0.index {
+            return None;
+        }
+
+        let mut current = self.clone();
+
+        while current.0.index > target_index {
+            let current_index = current.0.index;
+            let skip_index = get_skip_index(current_index);
+            let skip_index_prev = if current_index > 0 {
+                get_skip_index(current_index - 1)
+            } else {
+                0
+            };
+
+            // Use skip pointer if it's beneficial
+            if let Some(skip_cp) = current.skip() {
+                if skip_index == target_index
+                    || (skip_index > target_index
+                        && !(skip_index_prev < skip_index.saturating_sub(2)
+                            && skip_index_prev >= target_index))
+                {
+                    current = skip_cp;
+                } else if let Some(prev_cp) = current.prev() {
+                    current = prev_cp;
+                } else {
+                    return None;
+                }
+            } else if let Some(prev_cp) = current.prev() {
+                current = prev_cp;
+            } else {
+                return None;
+            }
+        }
+
+        if current.0.index == target_index {
+            Some(current)
+        } else {
+            None
         }
     }
 
@@ -229,30 +307,6 @@ impl<T: fmt::Debug + Clone + PartialEq> PartialEq for CheckPoint<T> {
     }
 }
 
-/// Node containing both a key and value. The key is referred to as `height`.
-#[derive(Debug)]
-pub(crate) struct Node<T> {
-    pub height: u32,
-    pub value: T,
-    pub prev: Option<Arc<Node<T>>>,
-    // pointer to a Node further back
-    pub skip: Option<Arc<Node<T>>>,
-}
-
-impl<T> Drop for Node<T> {
-    fn drop(&mut self) {
-        let mut current = self.prev.take();
-        while let Some(node) = current {
-            match Arc::into_inner(node) {
-                Some(mut node) => {
-                    current = node.prev.take();
-                }
-                None => break,
-            }
-        }
-    }
-}
-
 /// CheckPoint iter.
 pub struct CheckPointIter<T> {
     cur: Option<Arc<Node<T>>>,
@@ -275,6 +329,23 @@ fn get_skip_height(height: u32) -> u32 {
         return 0;
     }
     let n = height as i32;
+    let ret = if n & 1 == 0 {
+        invert_lowest_1(n)
+    } else {
+        // Handle odd case separately
+        invert_lowest_1(invert_lowest_1(n - 1)) + 1
+    };
+    ret.try_into().expect("n should be >= 0")
+}
+
+/// Compute what index to jump back to with the skip pointer.
+/// ref: GetSkipHeight <https://github.com/bitcoin/bitcoin/blob/2d6426c296ea43e62980d87d94fde0e94318a341/src/chain.cpp#L83>
+/// This is the same algorithm as get_skip_height but operates on indices.
+fn get_skip_index(index: usize) -> usize {
+    if index < 2 {
+        return 0;
+    }
+    let n = index as i32;
     let ret = if n & 1 == 0 {
         invert_lowest_1(n)
     } else {
@@ -426,5 +497,38 @@ mod test {
                 "skip height must be less than current height"
             );
         }
+    }
+
+    #[test]
+    fn test_index_based_operations() {
+        let mut cp = CheckPoint::new(0, 0);
+
+        // Push some checkpoints with non-contiguous heights (sparse)
+        cp = cp.push(10, 10).unwrap();
+        cp = cp.push(25, 25).unwrap();
+        cp = cp.push(100, 100).unwrap();
+        cp = cp.push(500, 500).unwrap();
+
+        // Test index access - should work regardless of height gaps
+        let cp_at_index_0 = cp.get_index(0).expect("index 0 should exist");
+        assert_eq!(cp_at_index_0.height(), 0);
+        assert_eq!(cp_at_index_0.value(), 0);
+        assert_eq!(cp_at_index_0.index(), 0);
+
+        let cp_at_index_2 = cp.get_index(2).expect("index 2 should exist");
+        assert_eq!(cp_at_index_2.height(), 25);
+        assert_eq!(cp_at_index_2.value(), 25);
+        assert_eq!(cp_at_index_2.index(), 2);
+
+        let cp_at_index_4 = cp.get_index(4).expect("index 4 should exist");
+        assert_eq!(cp_at_index_4.height(), 500);
+        assert_eq!(cp_at_index_4.value(), 500);
+        assert_eq!(cp_at_index_4.index(), 4);
+
+        // Test that skip pointers are created based on index
+        assert!(cp.skip().is_some(), "head should have skip pointer");
+
+        // Test non-existent index
+        assert!(cp.get_index(10).is_none(), "index 10 should not exist");
     }
 }
