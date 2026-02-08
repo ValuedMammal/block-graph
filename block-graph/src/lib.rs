@@ -12,7 +12,6 @@ extern crate alloc;
 extern crate std;
 
 mod block_graph;
-#[allow(unused)]
 pub mod checkpoint;
 pub use block_graph::*;
 
