@@ -3,6 +3,8 @@
 #![warn(missing_docs)]
 #![no_std]
 
+#[macro_use]
+#[allow(unused_imports)]
 extern crate alloc;
 
 #[cfg(feature = "std")]
@@ -10,6 +12,8 @@ extern crate alloc;
 extern crate std;
 
 mod block_graph;
+#[allow(unused)]
+pub mod checkpoint;
 pub use block_graph::*;
 
 #[cfg(feature = "std")]
