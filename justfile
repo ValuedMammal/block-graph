@@ -22,3 +22,6 @@ test:
 
 cp:
     cargo test -p block_graph --lib -- checkpoint::test
+
+bench:
+    cargo bench -p block_graph --bench block_graph_checkpoint
