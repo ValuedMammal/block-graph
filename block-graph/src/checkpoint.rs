@@ -24,6 +24,7 @@ where
             height,
             value,
             prev: None,
+            skip: None,
         }))
     }
 
@@ -58,11 +59,20 @@ where
         if self.height() >= height {
             return Err(self);
         }
+
+        // Calculate skip pointer before creating the node
+        let skip = {
+            let skip_height = get_skip_height_for(height);
+            self.get(skip_height).map(|cp| cp.0)
+        };
+
         let node = Node {
             height,
             value,
             prev: Some(self.0),
+            skip,
         };
+
         Ok(Self(Arc::new(node)))
     }
 
@@ -123,8 +133,8 @@ where
     }
 
     /// Iter.
-    pub fn iter(&self) -> ListIter<T> {
-        ListIter {
+    pub fn iter(&self) -> CheckPointIter<T> {
+        CheckPointIter {
             cur: Some(self.0.clone()),
         }
     }
@@ -151,20 +161,14 @@ where
             })
     }
 
+    /// Return the skip CheckPoint of this CheckPoint.
+    fn skip(&self) -> Option<Self> {
+        self.0.skip.clone().map(Self)
+    }
+
     /// Compute what height to jump back to with the skip.
     fn get_skip_height(&self) -> u32 {
-        let height = self.0.height;
-        if height < 2 {
-            return 0;
-        }
-        let n = height as i32;
-        // Handle odd case separately
-        let ret = if n % 2 == 0 {
-            invert_lowest_1(n)
-        } else {
-            invert_lowest_1(invert_lowest_1(n - 1)) + 1
-        };
-        ret.try_into().expect("n should be >= 0")
+        get_skip_height_for(self.0.height)
     }
 }
 
@@ -188,8 +192,8 @@ pub(crate) struct Node<T> {
     pub height: u32,
     pub value: T,
     pub prev: Option<Arc<Node<T>>>,
-    // TODO
-    // pub skip: Option<Arc<Node<T>>>,
+    // pointer to a Node further back
+    pub skip: Option<Arc<Node<T>>>,
 }
 
 impl<T> Drop for Node<T> {
@@ -207,11 +211,11 @@ impl<T> Drop for Node<T> {
 }
 
 /// CheckPoint iter.
-pub struct ListIter<T> {
+pub struct CheckPointIter<T> {
     cur: Option<Arc<Node<T>>>,
 }
 
-impl<T> Iterator for ListIter<T> {
+impl<T> Iterator for CheckPointIter<T> {
     type Item = CheckPoint<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -220,6 +224,21 @@ impl<T> Iterator for ListIter<T> {
 
         Some(CheckPoint(cur))
     }
+}
+
+/// Compute what height to jump back to with the skip for a given height.
+fn get_skip_height_for(height: u32) -> u32 {
+    if height < 2 {
+        return 0;
+    }
+    let n = height as i32;
+    let ret = if n & 1 == 0 {
+        invert_lowest_1(n)
+    } else {
+        // Handle odd case separately
+        invert_lowest_1(invert_lowest_1(n - 1)) + 1
+    };
+    ret.try_into().expect("n should be >= 0")
 }
 
 /// Flips the lowest bit of `n` from 1 to 0 and returns the result.
@@ -261,6 +280,7 @@ mod test {
             cp = cp.push(height, value).unwrap();
         }
 
+        // test_height = 2
         // 2 & (2 - 1)
         //     0000 0010
         // &   0000 0001
@@ -270,6 +290,7 @@ mod test {
         let result = dbg!(test_cp.get_skip_height());
         assert_eq!(result, 0);
 
+        // test_height = 4
         // 4 & (4 - 1)
         //     0000 0100
         // &   0000 0011
@@ -279,6 +300,7 @@ mod test {
         let result = dbg!(test_cp.get_skip_height());
         assert_eq!(result, 0);
 
+        // test_height = 6
         // 6 & (6 - 1)
         //     0000 0110
         // &   0000 0101
@@ -288,6 +310,7 @@ mod test {
         let result = dbg!(test_cp.get_skip_height());
         assert_eq!(result, 4);
 
+        // test_height = 8
         // 8 & (8 - 1)
         //   0000 1000
         // & 0000 0111
@@ -296,6 +319,8 @@ mod test {
         let test_cp = cp.get(test_height).unwrap();
         let result = dbg!(test_cp.get_skip_height());
         assert_eq!(result, 0);
+
+        // TODO: Test some larger values 256, 1024, 65535
     }
 
     #[test]
@@ -307,7 +332,8 @@ mod test {
             cp = cp.push(height, value).unwrap();
         }
 
-        // 3 is odd: invert_lowest_1(invert_lowest_1(3 - 1)) + 1
+        // test_height = 3
+        // invert_lowest_1(invert_lowest_1(3 - 1)) + 1
         // invert_lowest_1(2) = 2 & 1 = 0
         // invert_lowest_1(0) = 0 & -1 = 0
         // result: 0 + 1 = 1
@@ -316,7 +342,8 @@ mod test {
         let result = dbg!(test_cp.get_skip_height());
         assert_eq!(result, 1);
 
-        // 5 is odd: invert_lowest_1(invert_lowest_1(5 - 1)) + 1
+        // test_height = 5
+        // invert_lowest_1(invert_lowest_1(5 - 1)) + 1
         // invert_lowest_1(4) = 4 & 3 = 0
         // invert_lowest_1(0) = 0 & -1 = 0
         // result: 0 + 1 = 1
@@ -325,7 +352,8 @@ mod test {
         let result = dbg!(test_cp.get_skip_height());
         assert_eq!(result, 1);
 
-        // 9 is odd: invert_lowest_1(invert_lowest_1(9 - 1)) + 1
+        // test_height = 9
+        // invert_lowest_1(invert_lowest_1(9 - 1)) + 1
         // invert_lowest_1(8) = 8 & 7 = 0
         // invert_lowest_1(0) = 0 & -1 = 0
         // result: 0 + 1 = 1
@@ -334,7 +362,8 @@ mod test {
         let result = dbg!(test_cp.get_skip_height());
         assert_eq!(result, 1);
 
-        // 15 is odd: invert_lowest_1(invert_lowest_1(15 - 1)) + 1
+        // test_height = 15
+        // invert_lowest_1(invert_lowest_1(15 - 1)) + 1
         // invert_lowest_1(14) = 14 & 13 = 12
         // invert_lowest_1(12) = 12 & 11 = 8
         // result: 8 + 1 = 9
@@ -342,5 +371,26 @@ mod test {
         let test_cp = cp.get(test_height).unwrap();
         let result = dbg!(test_cp.get_skip_height());
         assert_eq!(result, 9);
+    }
+
+    #[test]
+    fn test_skip_pointer_validity() {
+        let mut cp = CheckPoint::new(0, 0);
+
+        for height in 1..100 {
+            let value = height;
+            cp = cp.push(height, value).unwrap();
+        }
+
+        // For each node, verify that its skip pointer (if present) points to a node
+        // with a smaller height that is further back in the chain
+        for height in 1..100 {
+            let test_cp = cp.get(height).unwrap();
+            let skip_cp = test_cp.skip().expect("every non-zero Node should have a skip");
+            assert!(
+                skip_cp.height() < height,
+                "skip height must be less than current height"
+            );
+        }
     }
 }
