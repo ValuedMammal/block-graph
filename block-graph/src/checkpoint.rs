@@ -7,8 +7,10 @@ use core::fmt::Debug;
 use core::ops::RangeBounds;
 
 // TODO:
-// - implement pksip
-// - bench perf
+// - Implement Node::ksip
+// - Improve `get` efficiency
+// - Add Node::index which stores the numerical index of a checkpoint
+// - Change to `get_skip_index`, since in a "sparse" chain we can't assume all heights are present
 
 /// CheckPoint, guaranteed to have at least 1 element.
 #[derive(Debug)]
@@ -62,7 +64,7 @@ where
 
         // Calculate skip pointer before creating the node
         let skip = {
-            let skip_height = get_skip_height_for(height);
+            let skip_height = get_skip_height(height);
             self.get(skip_height).map(|cp| cp.0)
         };
 
@@ -127,6 +129,11 @@ where
         self.0.value.clone()
     }
 
+    /// Return the skip CheckPoint of this CheckPoint.
+    fn skip(&self) -> Option<Self> {
+        self.0.skip.clone().map(Self)
+    }
+
     /// Whether `self` and `other` share the same underlying pointer.
     pub fn eq_ptr(&self, other: &Self) -> bool {
         Arc::as_ptr(&self.0) == Arc::as_ptr(&other.0)
@@ -141,7 +148,53 @@ where
 
     /// Get.
     pub fn get(&self, height: u32) -> Option<Self> {
-        self.range(height..=height).next()
+        // If target height is greater than current height, it can't exist in this chain
+        if height > self.height() {
+            return None;
+        }
+
+        let mut current = self.clone();
+
+        while current.height() > height {
+            let current_height = current.height();
+            let skip_height = get_skip_height(current_height);
+            let skip_height_prev = if current_height > 0 {
+                get_skip_height(current_height.saturating_sub(1))
+            } else {
+                0
+            };
+
+            // Decide whether to use skip pointer or prev pointer
+            if let Some(skip_cp) = current.skip() {
+                if skip_height == height
+                    || (skip_height > height
+                        && !(skip_height_prev < skip_height.saturating_sub(2)
+                            && skip_height_prev >= height))
+                {
+                    // Use skip pointer - it's either exact or more efficient
+                    current = skip_cp;
+                } else if let Some(prev_cp) = current.prev() {
+                    // Use prev pointer - skip would overshoot inefficiently
+                    current = prev_cp;
+                } else {
+                    // No more nodes to traverse
+                    return None;
+                }
+            } else if let Some(prev_cp) = current.prev() {
+                // No skip pointer available, use prev
+                current = prev_cp;
+            } else {
+                // No more nodes to traverse
+                return None;
+            }
+        }
+
+        // Check if we found the exact height
+        if current.height() == height {
+            Some(current)
+        } else {
+            None
+        }
     }
 
     /// Range.
@@ -159,16 +212,6 @@ where
                 core::ops::Bound::Excluded(excluded) => cp.height() > excluded,
                 core::ops::Bound::Unbounded => true,
             })
-    }
-
-    /// Return the skip CheckPoint of this CheckPoint.
-    fn skip(&self) -> Option<Self> {
-        self.0.skip.clone().map(Self)
-    }
-
-    /// Compute what height to jump back to with the skip.
-    fn get_skip_height(&self) -> u32 {
-        get_skip_height_for(self.0.height)
     }
 }
 
@@ -227,7 +270,7 @@ impl<T> Iterator for CheckPointIter<T> {
 }
 
 /// Compute what height to jump back to with the skip for a given height.
-fn get_skip_height_for(height: u32) -> u32 {
+fn get_skip_height(height: u32) -> u32 {
     if height < 2 {
         return 0;
     }
@@ -275,7 +318,7 @@ mod test {
     fn test_get_skip_height_even() {
         let mut cp = CheckPoint::new(0, 0);
 
-        for height in 1..100 {
+        for height in 1..=1024 {
             let value = height;
             cp = cp.push(height, value).unwrap();
         }
@@ -286,8 +329,7 @@ mod test {
         // &   0000 0001
         // res 0000 0000
         let test_height = 2;
-        let test_cp = cp.get(test_height).unwrap();
-        let result = dbg!(test_cp.get_skip_height());
+        let result = get_skip_height(test_height);
         assert_eq!(result, 0);
 
         // test_height = 4
@@ -296,8 +338,7 @@ mod test {
         // &   0000 0011
         // res 0000 0000
         let test_height = 4;
-        let test_cp = cp.get(test_height).unwrap();
-        let result = dbg!(test_cp.get_skip_height());
+        let result = get_skip_height(test_height);
         assert_eq!(result, 0);
 
         // test_height = 6
@@ -306,8 +347,7 @@ mod test {
         // &   0000 0101
         // res 0000 0100
         let test_height = 6;
-        let test_cp = cp.get(test_height).unwrap();
-        let result = dbg!(test_cp.get_skip_height());
+        let result = get_skip_height(test_height);
         assert_eq!(result, 4);
 
         // test_height = 8
@@ -316,11 +356,8 @@ mod test {
         // & 0000 0111
         // result:
         let test_height = 8;
-        let test_cp = cp.get(test_height).unwrap();
-        let result = dbg!(test_cp.get_skip_height());
+        let result = get_skip_height(test_height);
         assert_eq!(result, 0);
-
-        // TODO: Test some larger values 256, 1024, 65535
     }
 
     #[test]
@@ -338,8 +375,7 @@ mod test {
         // invert_lowest_1(0) = 0 & -1 = 0
         // result: 0 + 1 = 1
         let test_height = 3;
-        let test_cp = cp.get(test_height).unwrap();
-        let result = dbg!(test_cp.get_skip_height());
+        let result = get_skip_height(test_height);
         assert_eq!(result, 1);
 
         // test_height = 5
@@ -348,8 +384,7 @@ mod test {
         // invert_lowest_1(0) = 0 & -1 = 0
         // result: 0 + 1 = 1
         let test_height = 5;
-        let test_cp = cp.get(test_height).unwrap();
-        let result = dbg!(test_cp.get_skip_height());
+        let result = get_skip_height(test_height);
         assert_eq!(result, 1);
 
         // test_height = 9
@@ -358,8 +393,7 @@ mod test {
         // invert_lowest_1(0) = 0 & -1 = 0
         // result: 0 + 1 = 1
         let test_height = 9;
-        let test_cp = cp.get(test_height).unwrap();
-        let result = dbg!(test_cp.get_skip_height());
+        let result = get_skip_height(test_height);
         assert_eq!(result, 1);
 
         // test_height = 15
@@ -368,8 +402,7 @@ mod test {
         // invert_lowest_1(12) = 12 & 11 = 8
         // result: 8 + 1 = 9
         let test_height = 15;
-        let test_cp = cp.get(test_height).unwrap();
-        let result = dbg!(test_cp.get_skip_height());
+        let result = get_skip_height(test_height);
         assert_eq!(result, 9);
     }
 
@@ -387,6 +420,7 @@ mod test {
         for height in 1..100 {
             let test_cp = cp.get(height).unwrap();
             let skip_cp = test_cp.skip().expect("every non-zero Node should have a skip");
+            println!("height={}, skip_cp_height={}", height, skip_cp.height());
             assert!(
                 skip_cp.height() < height,
                 "skip height must be less than current height"

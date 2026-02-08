@@ -21,4 +21,4 @@ test:
     cargo test --workspace --all-features -- --test-threads=1
 
 cp:
-    cargo test -p block_graph --lib -- checkpoint
+    cargo test -p block_graph --lib -- checkpoint::test --show-output
