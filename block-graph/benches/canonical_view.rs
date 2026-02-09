@@ -6,10 +6,12 @@ use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
 
 use bdk_chain::bitcoin;
-use bdk_chain::{BlockId, CanonicalizationParams, CheckPoint};
+use bdk_chain::{BlockId, CanonicalizationParams};
 use bitcoin::{absolute::LockTime, transaction, Amount, ScriptBuf, Transaction, TxIn, TxOut};
 
 const CT: usize = 2_000;
+
+use block_graph::CheckPoint;
 
 type TxGraph = bdk_chain::TxGraph<BlockId>;
 type BlockGraph = block_graph::BlockGraph<BlockHash>;
@@ -39,8 +41,11 @@ fn canonical_view_txs(c: &mut Criterion) {
         let chain_tip = chain.tip();
         let _ = chain
             .apply_update(
-                CheckPoint::from_blocks([(chain_tip.height, chain_tip.hash), (id.height, id.hash)])
-                    .unwrap(),
+                CheckPoint::from_entries([
+                    (chain_tip.height, chain_tip.hash),
+                    (id.height, id.hash),
+                ])
+                .unwrap(),
             )
             .unwrap();
 

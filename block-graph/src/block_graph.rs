@@ -8,12 +8,12 @@ use core::fmt::Debug;
 use core::ops::RangeBounds;
 
 use bdk_chain::{
-    bitcoin, local_chain::MissingGenesisError, BlockId, ChainOracle, CheckPoint, Merge, ToBlockHash,
+    bitcoin, local_chain::MissingGenesisError, BlockId, ChainOracle, Merge, ToBlockHash,
 };
 use bitcoin::{hashes::Hash, BlockHash};
-use skiplist::{SkipList, SkipListIter};
 
 use crate::collections::{BTreeSet, HashMap, HashSet};
+use crate::CheckPoint;
 
 /// Default capacity of the `BlockGraph` if not provided.
 pub const DEFAULT_CAPACITY: usize = 1 << 20;
@@ -28,31 +28,21 @@ pub struct BlockGraph<T> {
     /// The root hash, aka genesis.
     root: BlockHash,
     /// The canonical list of blocks in the chain.
-    tip: SkipList<T>,
+    tip: CheckPoint<T>,
 }
 
 impl<T: ToBlockHash + Debug + Ord + Clone> BlockGraph<T> {
-    /// From genesis `block` with the default capacity.
-    pub fn from_genesis(block: T) -> Self {
-        Self::from_genesis_with_capacity(block, DEFAULT_CAPACITY)
-    }
-
-    /// From genesis `block` with the given capacity.
-    ///
-    /// - `cap`: How many nodes are expected to exist in the canonical chain over the lifetime
-    ///   of this `BlockGraph`. The `BlockGraph` may grow to beyond the specified `cap`, however the
-    ///   performance benefits can diminish as the internal skiplist becomes more densely populated.
-    fn from_genesis_with_capacity(block: T, cap: usize) -> Self {
+    /// From genesis `data`.
+    pub fn from_genesis(data: T) -> Self {
         let genesis_height = 0;
-        let genesis_hash = block.to_blockhash();
+        let genesis_hash = data.to_blockhash();
 
         let mut blocks = HashMap::new();
-        blocks.insert(genesis_hash, (genesis_height, block.clone()));
+        blocks.insert(genesis_hash, (genesis_height, data.clone()));
         let mut next_hashes = HashMap::new();
         next_hashes.insert(BlockHash::all_zeros(), [genesis_hash].into());
         let root = genesis_hash;
-        let mut tip = SkipList::with_capacity(cap);
-        tip.insert(genesis_height, block);
+        let tip = CheckPoint::new(genesis_height, data);
 
         Self {
             blocks,
@@ -64,25 +54,25 @@ impl<T: ToBlockHash + Debug + Ord + Clone> BlockGraph<T> {
 
     /// Get the chain tip block id.
     pub fn tip(&self) -> BlockId {
-        let (tip_height, block) = self.tip.iter().next().expect("chain tip must be non-empty");
+        let cp = self.tip.iter().next().expect("chain tip must be non-empty");
         BlockId {
-            height: *tip_height,
-            hash: block.to_blockhash(),
+            height: cp.height(),
+            hash: cp.0.value.to_blockhash(),
         }
     }
 
     /// Get the value of a node in the best chain by `height`.
-    pub fn get(&self, height: u32) -> Option<&T> {
+    pub fn get(&self, height: u32) -> Option<CheckPoint<T>> {
         self.tip.get(height)
     }
 
     /// Iterate items of the canonical chain.
-    pub fn iter(&self) -> SkipListIter<'_, (u32, T)> {
+    pub fn iter(&self) -> impl Iterator<Item = CheckPoint<T>> {
         self.tip.iter()
     }
 
     /// Iterate items of the canonical chain within a specified `range` of heights.
-    pub fn range(&self, range: impl RangeBounds<u32>) -> impl Iterator<Item = &(u32, T)> {
+    pub fn range(&self, range: impl RangeBounds<u32>) -> impl Iterator<Item = CheckPoint<T>> {
         self.tip.range(range)
     }
 
@@ -168,8 +158,9 @@ impl<T: ToBlockHash + Debug + Ord + Clone> BlockGraph<T> {
         };
 
         // Now that we know the tip we need to populate the canonical chain
-        // by traversing back to the root and inserting block data along
+        // by traversing back to the root and collecting block data along
         // the way.
+        let mut block_data = vec![];
         let mut cur = Some(best_block.hash);
         while let Some(hash) = cur {
             // Get block data from graph.
@@ -177,15 +168,23 @@ impl<T: ToBlockHash + Debug + Ord + Clone> BlockGraph<T> {
                 Some(value) => value,
                 None => break,
             };
-            // Insert data into tip.
-            graph.tip.insert(height, data);
+            block_data.push((height, data));
             // Get next parent hash.
             // The canonical parent is the one with the highest order block id.
             cur = parents.get(&hash).and_then(|parents| parents.last().map(|id| id.hash));
         }
 
+        let mut tip = graph.tip.clone();
+        for (height, data) in block_data.into_iter().rev() {
+            tip = tip.insert(height, data);
+        }
+        graph.tip = tip;
+
         debug_assert!(
-            graph.tip.get(0).is_some_and(|d| d.to_blockhash() == genesis_hash),
+            graph
+                .tip
+                .get(0)
+                .is_some_and(|cp| cp.value().to_blockhash() == genesis_hash),
             "failed to canonicalize blockgraph"
         );
 
@@ -218,7 +217,7 @@ impl<T: ToBlockHash + Debug + Ord + Clone> BlockGraph<T> {
     {
         self.apply_update_connected_to(
             tip.iter()
-                .map(|cp| (cp.height(), cp.data(), cp.prev().map(|cp| cp.hash()))),
+                .map(|cp| (cp.height(), cp.value(), cp.prev().map(|cp| cp.hash()))),
         )
     }
 
@@ -243,22 +242,20 @@ impl<T: ToBlockHash + Debug + Ord + Clone> BlockGraph<T> {
 
     /// Apply changeset. This should be infallible since we only call it after successfully
     /// merging chains.
-    fn apply_changeset(&mut self, changeset: ChangeSet<T>, disconnections: Vec<BlockId>) {
+    fn apply_changeset(&mut self, changeset: ChangeSet<T>, _disconnections: Vec<BlockId>) {
         // First add blocks to graph.
         for (BlockId { height, hash }, data, parent_hash) in changeset.blocks.iter() {
             self.blocks.insert(*hash, (*height, data.clone()));
             self.next_hashes.entry(*parent_hash).or_default().insert(*hash);
         }
 
-        // If there are disconnections remove them from the canonical list,
-        // before applying the newly added blocks.
-        for block_id in disconnections {
-            let height = block_id.height;
-            let _ = self.tip.remove(height);
-        }
+        // Update the canonical chain tip. Any stale conflicts that exist in self.tip
+        // are purged by inserting the new data.
+        let mut new_tip = self.tip.clone();
         for (BlockId { height, .. }, data, _) in changeset.blocks {
-            self.tip.insert(height, data);
+            new_tip = new_tip.insert(height, data);
         }
+        self.tip = new_tip;
     }
 }
 
@@ -291,13 +288,13 @@ impl<T: ToBlockHash + Debug + Ord + Clone> ChainOracle for BlockGraph<T> {
         if self
             .tip
             .get(chain_tip.height)
-            .is_none_or(|data| data.to_blockhash() != chain_tip.hash)
+            .is_none_or(|cp| cp.value().to_blockhash() != chain_tip.hash)
         {
             return Ok(None);
         }
         // A block of given height must exist in this chain, and the hashes must match.
         match self.tip.get(block.height) {
-            Some(data) => Ok(Some(data.to_blockhash() == block.hash)),
+            Some(cp) => Ok(Some(cp.value().to_blockhash() == block.hash)),
             None => Ok(None),
         }
     }
@@ -341,23 +338,6 @@ impl<T> BlockGraph<T>
 where
     T: ToBlockHash + Debug + Ord + Copy,
 {
-    /// Get blocks of the canonical chain as a single [`CheckPoint`].
-    ///
-    /// This is here in order to remain interoperable with code that interfaces with
-    /// [`LocalChain`](bdk_chain::local_chain::LocalChain), etc.
-    pub fn checkpoint(&self) -> CheckPoint<T> {
-        self.tip
-            .iter()
-            .rev()
-            .fold(Option::<CheckPoint<T>>::None, |acc, &item| match acc {
-                None => Some(CheckPoint::from_blocks([item]).expect("CP must be non-empty")),
-                Some(cp) => {
-                    Some(cp.extend([item]).expect("blocks must be in ascending height order"))
-                }
-            })
-            .expect("`self.tip` must be non-empty")
-    }
-
     /// Merges `update` with `self` and returns the resulting [`ChangeSet`], along with any
     /// disconnections that occurred.
     ///
@@ -376,7 +356,7 @@ where
     where
         I: Iterator<Item = (u32, T, Option<BlockHash>)>,
     {
-        let mut original_tip = self.tip.iter().copied().peekable();
+        let mut original_tip = self.tip.iter().peekable();
         let mut update_tip = update.peekable();
 
         let mut point_of_agreement = None;
@@ -402,10 +382,11 @@ where
                     let parent_hash = parent_hash.unwrap_or_else(|| {
                         self.range(0..update_height)
                             .next()
-                            .map(|(_height, data)| data.to_blockhash())
+                            .map(|cp| cp.value().to_blockhash())
                             .expect("range must be non-empty")
                     });
-                    let (height, data) = *original;
+                    let height = original.height();
+                    let data = original.value();
                     let original_hash = data.to_blockhash();
                     let block_id = (height, original_hash).into();
                     let update_hash = update.to_blockhash();
@@ -537,39 +518,8 @@ mod test {
         let _ = graph.apply_update(cp).unwrap();
 
         blocks.reverse();
-        let tip_blocks = graph.iter().copied().map(BlockId::from).collect::<Vec<_>>();
+        let tip_blocks = graph.iter().map(|cp| cp.block_id()).collect::<Vec<_>>();
         assert_eq!(tip_blocks, blocks);
-    }
-
-    #[test]
-    fn test_checkpoint() {
-        let genesis_block = BlockId {
-            height: 0,
-            hash: Hash::hash(b"0"),
-        };
-        let block_1 = BlockId {
-            height: 1,
-            hash: Hash::hash(b"1"),
-        };
-        let block_2 = BlockId {
-            height: 2,
-            hash: Hash::hash(b"2"),
-        };
-        let changeset = ChangeSet {
-            blocks: [
-                (genesis_block, genesis_block.hash, BlockHash::all_zeros()),
-                (block_1, block_1.hash, genesis_block.hash),
-                (block_2, block_2.hash, block_1.hash),
-            ]
-            .into(),
-        };
-        let graph = BlockGraph::from_changeset(changeset).unwrap().unwrap();
-
-        let cp = graph.checkpoint();
-        assert_eq!(cp.clone().iter().count(), 3);
-        assert_eq!(cp.get(2).map(|cp| cp.block_id()), Some(block_2));
-        assert_eq!(cp.get(1).map(|cp| cp.block_id()), Some(block_1));
-        assert_eq!(cp.get(0).map(|cp| cp.block_id()), Some(genesis_block));
     }
 
     #[test]
@@ -605,7 +555,7 @@ mod test {
             hash: Hash::hash(b"0"),
         };
         let mut graph = BlockGraph::from_genesis(genesis_block.hash);
-        let mut tip = graph.checkpoint();
+        let mut tip = graph.tip.clone();
         let block_1 = BlockId {
             height: 1,
             hash: Hash::hash(b"1"),
@@ -624,7 +574,7 @@ mod test {
             hash: Hash::hash(b"0"),
         };
         let mut graph = BlockGraph::from_genesis(genesis_block.hash);
-        let mut tip = graph.checkpoint();
+        let mut tip = graph.tip.clone();
         let block_1 = BlockId {
             height: 1,
             hash: Hash::hash(b"one"),
@@ -677,7 +627,7 @@ mod test {
         let res = graph.merge_chains(
             update
                 .iter()
-                .map(|cp| (cp.height(), cp.data(), cp.prev().map(|cp| cp.hash()))),
+                .map(|cp| (cp.height(), cp.value(), cp.prev().map(|cp| cp.hash()))),
         );
         assert!(matches!(
             res,
@@ -712,7 +662,7 @@ mod test {
             height: 1,
             hash: Hash::hash(b"1"),
         };
-        let mut tip = graph.checkpoint().get(0).unwrap();
+        let mut tip = graph.tip.get(0).unwrap();
         tip = tip.push(block_1.height, block_1.hash).unwrap();
         let changeset = graph.apply_update(tip).unwrap();
         assert_eq!(changeset.blocks.len(), 1);
@@ -743,7 +693,7 @@ mod test {
         assert_eq!(graph.blocks.len(), 2);
 
         // Now invalidate the tip
-        let mut tip = graph.checkpoint();
+        let mut tip = graph.tip.clone();
         let block_1a = BlockId {
             height: 1,
             hash: Hash::hash(b"1a"),
@@ -753,7 +703,7 @@ mod test {
         let (changeset, disconnections) = graph
             .merge_chains(
                 tip.iter()
-                    .map(|cp| (cp.height(), cp.data(), cp.prev().map(|cp| cp.hash()))),
+                    .map(|cp| (cp.height(), cp.value(), cp.prev().map(|cp| cp.hash()))),
             )
             .unwrap();
         assert_eq!(
@@ -796,7 +746,7 @@ mod test {
         assert_eq!(graph.blocks.len(), 3);
 
         // Now invalidate two blocks
-        let mut tip = graph.checkpoint().get(1).unwrap();
+        let mut tip = graph.tip.get(1).unwrap();
         let block_1a = BlockId {
             height: 1,
             hash: Hash::hash(b"1a"),
@@ -806,7 +756,7 @@ mod test {
         let (changeset, disconnections) = graph
             .merge_chains(
                 tip.iter()
-                    .map(|cp| (cp.height(), cp.data(), cp.prev().map(|cp| cp.hash()))),
+                    .map(|cp| (cp.height(), cp.value(), cp.prev().map(|cp| cp.hash()))),
             )
             .unwrap();
         assert_eq!(

@@ -6,13 +6,17 @@ use core::fmt;
 use core::fmt::Debug;
 use core::ops::RangeBounds;
 
+use bdk_chain::{bitcoin, BlockId, ToBlockHash};
+use bitcoin::BlockHash;
+
 // TODO:
 // - Implement Node::skip
 // - Improve `get` efficiency
-// - Add Node::index that stores the numerical index of a checkpoint starting from 0
+// - Add Node::index that stores the numeric index of a checkpoint starting from 0
 // - Change to `get_skip_index` (instead of height), since in a "sparse" chain we can't assume that all heights are present
 // - As we're now tracking the index, we should be able to implement `CheckPoint::len` for free
 // - `range` could be improve to utilize fast search to the end bound
+// - Store the blockhash inside Node, to avoid continually re-hashing
 
 /// CheckPoint, guaranteed to have at least 1 element.
 #[derive(Debug)]
@@ -22,6 +26,7 @@ pub struct CheckPoint<T>(pub(crate) Arc<Node<T>>);
 #[derive(Debug)]
 pub(crate) struct Node<T> {
     pub height: u32,
+    pub hash: BlockHash,
     pub value: T,
     pub prev: Option<Arc<Node<T>>>,
     // pointer to a Node further back
@@ -45,12 +50,13 @@ impl<T> Drop for Node<T> {
 
 impl<T> CheckPoint<T>
 where
-    T: Debug,
+    T: Debug + ToBlockHash,
 {
     /// Start a new list with `value` at the head.
     pub fn new(height: u32, value: T) -> Self {
         Self(Arc::new(Node {
             height,
+            hash: value.to_blockhash(),
             value,
             prev: None,
             skip: None,
@@ -99,6 +105,7 @@ where
 
         let node = Node {
             height,
+            hash: value.to_blockhash(),
             value,
             prev: Some(self.0),
             skip: skip_node,
@@ -108,6 +115,58 @@ where
         Ok(Self(Arc::new(node)))
     }
 
+    /// Insert.
+    ///
+    /// Note this allows replacing the value of an entry. This panics if the caller attempts to
+    /// replace the root of the current list.
+    pub fn insert(self, height: u32, value: T) -> Self
+    where
+        T: Clone + PartialEq,
+    {
+        let mut cur = self.clone();
+        let mut tail = vec![];
+
+        // Look for the next nearest node smaller than the given height.
+        let base = loop {
+            if cur.height() == height {
+                if cur.value() == value {
+                    return self;
+                }
+                // If we're replacing a value, the tail is by implication invalid.
+                tail = vec![];
+                break cur.prev().expect("cannot replace root");
+            }
+            // We found our base.
+            if cur.height() < height {
+                break cur;
+            }
+            tail.push((cur.height(), cur.value()));
+            cur = cur.prev().expect("will break before root");
+        };
+
+        base.extend(core::iter::once((height, value)).chain(tail.into_iter().rev()))
+            .expect("tail must be in order")
+    }
+
+    /// Range.
+    pub fn range(&self, range: impl RangeBounds<u32>) -> impl Iterator<Item = CheckPoint<T>> {
+        let start_bound = range.start_bound().cloned();
+        let end_bound = range.end_bound().cloned();
+        self.iter()
+            .skip_while(move |cp| match end_bound {
+                core::ops::Bound::Included(included) => cp.height() > included,
+                core::ops::Bound::Excluded(excluded) => cp.height() >= excluded,
+                core::ops::Bound::Unbounded => false,
+            })
+            .take_while(move |cp| match start_bound {
+                core::ops::Bound::Included(included) => cp.height() >= included,
+                core::ops::Bound::Excluded(excluded) => cp.height() > excluded,
+                core::ops::Bound::Unbounded => true,
+            })
+    }
+}
+
+impl<T> CheckPoint<T> {
     /// Prev.
     pub fn prev(&self) -> Option<Self> {
         self.0.prev.clone().map(Self)
@@ -116,6 +175,19 @@ where
     /// Height.
     pub fn height(&self) -> u32 {
         self.0.height
+    }
+
+    /// Hash.
+    pub fn hash(&self) -> BlockHash {
+        self.0.hash
+    }
+
+    /// BlockId.
+    pub fn block_id(&self) -> BlockId {
+        BlockId {
+            height: self.0.height,
+            hash: self.0.hash,
+        }
     }
 
     /// Value.
@@ -181,7 +253,7 @@ where
             let prev_skip_index = get_skip_index(prev_index);
             current = if let Some(skip_cp) = current.skip() {
                 if skip_index == target_index
-                    // Only follow skip if `prev_skip_index` isn't better
+                    // Only follow skip_cp if `prev_skip_index` isn't better
                     || (skip_index > target_index
                         && !(prev_skip_index < skip_index.saturating_sub(2)
                             && prev_skip_index >= target_index))
@@ -195,56 +267,6 @@ where
             }
         }
         (current.index() == target_index).then_some(current)
-    }
-
-    /// Insert.
-    ///
-    /// Note this allows replacing the value of an entry. This panics if the caller attempts to
-    /// replace the root of the current list.
-    pub fn insert(self, height: u32, value: T) -> Self
-    where
-        T: Clone + PartialEq,
-    {
-        let mut cur = self.clone();
-        let mut tail = vec![];
-
-        // Look for the next nearest node smaller than the given height.
-        let base = loop {
-            if cur.height() == height {
-                if cur.value() == value {
-                    return self;
-                }
-                // If we're replacing a value, the tail is by implication invalid.
-                tail = vec![];
-                break cur.prev().expect("cannot replace root");
-            }
-            // We found our base.
-            if cur.height() < height {
-                break cur;
-            }
-            tail.push((cur.height(), cur.value()));
-            cur = cur.prev().expect("will break before root");
-        };
-
-        base.extend(core::iter::once((height, value)).chain(tail.into_iter().rev()))
-            .expect("tail must be in order")
-    }
-
-    /// Range.
-    pub fn range(&self, range: impl RangeBounds<u32>) -> impl Iterator<Item = CheckPoint<T>> {
-        let start_bound = range.start_bound().cloned();
-        let end_bound = range.end_bound().cloned();
-        self.iter()
-            .skip_while(move |cp| match end_bound {
-                core::ops::Bound::Included(included) => cp.height() > included,
-                core::ops::Bound::Excluded(excluded) => cp.height() >= excluded,
-                core::ops::Bound::Unbounded => false,
-            })
-            .take_while(move |cp| match start_bound {
-                core::ops::Bound::Included(included) => cp.height() >= included,
-                core::ops::Bound::Excluded(excluded) => cp.height() > excluded,
-                core::ops::Bound::Unbounded => true,
-            })
     }
 }
 
@@ -303,20 +325,25 @@ fn get_skip_index(index: usize) -> usize {
 mod test {
     use super::*;
 
+    use bitcoin::hashes::Hash;
+
     #[test]
     fn test_get_with_100_elements() {
-        let mut cp = CheckPoint::new(0, 0);
+        let hash_0 = BlockHash::all_zeros();
+        let mut cp = CheckPoint::new(0, hash_0);
+        let mut expected_values = vec![hash_0];
 
-        for height in 1..100 {
-            let value = height;
+        for height in 1u32..100 {
+            let value: BlockHash = Hash::hash(height.to_be_bytes().as_slice());
+            expected_values.push(value);
             cp = cp.push(height, value).unwrap();
         }
 
         // Test getting elements at various heights
-        for i in 0..100 {
-            let result_cp = cp.get(i).expect("should find height");
-            assert_eq!(result_cp.height(), i);
-            assert_eq!(result_cp.value(), i);
+        for test_height in 0..100 {
+            let result_cp = cp.get(test_height).expect("cp should exist");
+            assert_eq!(result_cp.height(), test_height);
+            assert_eq!(result_cp.value(), expected_values[test_height as usize]);
         }
 
         // Test getting non-existent heights
@@ -351,10 +378,10 @@ mod test {
 
     #[test]
     fn test_skip_height_validity() {
-        let mut cp = CheckPoint::new(0, 0);
+        let mut cp = CheckPoint::new(0, BlockHash::all_zeros());
 
-        for height in 1..100 {
-            let value = height;
+        for height in 1u32..100 {
+            let value: BlockHash = Hash::hash(height.to_be_bytes().as_slice());
             cp = cp.push(height, value).unwrap();
         }
 
@@ -374,12 +401,12 @@ mod test {
     #[test]
     fn test_skip_index_validity() {
         let init_height = 0;
-        let mut cp = CheckPoint::<i32>::new(init_height, 0);
+        let mut cp = CheckPoint::<BlockHash>::new(init_height, BlockHash::all_zeros());
 
         // Create sparse chain where heights are multiples of 50
         for i in 1..20 {
             let height: u32 = 50 * (i as u32);
-            let value = i;
+            let value: BlockHash = Hash::hash(height.to_be_bytes().as_slice());
             cp = cp.push(height, value).unwrap();
         }
 
@@ -417,36 +444,25 @@ mod test {
 
     #[test]
     fn test_index_with_non_contiguous_heights() {
-        let mut cp = CheckPoint::new(0, 0);
+        let test_value = BlockHash::all_zeros();
+        let mut cp = CheckPoint::new(0, test_value);
+        assert_eq!(cp.get_index(0).unwrap(), cp);
+
+        let test_heights = [10, 25, 100, 500];
 
         // Push some checkpoints with non-contiguous heights (sparse)
-        cp = cp.push(10, 10).unwrap();
-        cp = cp.push(25, 25).unwrap();
-        cp = cp.push(100, 100).unwrap();
-        cp = cp.push(500, 500).unwrap();
-
-        // Test `get` at expected heights
-        let cp_0 = cp.get(0).expect("checkpoint 0 should exist");
-        assert_eq!(cp_0.height(), 0);
-        assert_eq!(cp_0.value(), 0);
-        assert_eq!(cp_0.index(), 0);
-
-        let cp_1 = cp.get(10).expect("checkpoint 10 should exist");
-        assert_eq!(cp_1.height(), 10);
-        assert_eq!(cp_1.value(), 10);
-        assert_eq!(cp_1.index(), 1);
-
-        let cp_2 = cp.get(25).expect("checkpoint 25 should exist");
-        assert_eq!(cp_2.height(), 25);
-        assert_eq!(cp_2.value(), 25);
-        assert_eq!(cp_2.index(), 2);
-
-        let cp_3 = cp.get(100).expect("checkpoint 100 should exist");
-        assert_eq!(cp_3.height(), 100);
-        assert_eq!(cp_3.value(), 100);
-        assert_eq!(cp_3.index(), 3);
+        for height in test_heights {
+            cp = cp.push(height, test_value).unwrap();
+        }
 
         assert!(cp.skip().is_some(), "head should have skip pointer");
+
+        // Test `get` at expected heights
+        for (expect_index, expect_height) in (1..).zip(test_heights) {
+            let result_cp = cp.get(expect_height).expect("checkpoint 0 should exist");
+            assert_eq!(result_cp.height(), expect_height);
+            assert_eq!(result_cp.index(), expect_index);
+        }
 
         // Test non-existent index
         assert!(cp.get(11).is_none(), "height 11 should not exist");

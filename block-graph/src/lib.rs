@@ -12,8 +12,9 @@ extern crate alloc;
 extern crate std;
 
 mod block_graph;
-pub mod checkpoint;
+mod checkpoint;
 pub use block_graph::*;
+pub use checkpoint::*;
 
 #[cfg(feature = "std")]
 pub(crate) mod collections {
