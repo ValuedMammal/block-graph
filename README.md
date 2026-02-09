@@ -1,5 +1,45 @@
 <!-- block-graph -->
 
+## Performance Summary
+
+To reproduce:
+```
+cargo bench -p block_graph --bench block_graph_checkpoint
+cargo bench -p block_graph --bench from_changeset
+cargo bench -p block_graph --bench canonical_view
+```
+
+### Time to search for a middle entry in a `CheckPoint<BlockHash>` containing $n$ elements
+
+<!-- branch: feat/blockgraph_checkpoint -->
+
+<!-- TODO: syntax for exponent -->
+
+| N | time (ns) |
+|---|---|
+| 2<sup>17</sup> | 18.6 |
+| 2<sup>18</sup> | 19.1 |
+| 2<sup>19</sup> | 20.4 |
+| 2<sup>20</sup> | 20.5 |
+
+---
+
+### Time to construct `BlockGraph<BlockHash>` from a `ChangeSet` containing $n$ elements
+
+| N | time (ms) |
+|---|---|
+| 10,000 | 4.5 |
+
+---
+
+### Time to canonicalize a `TxGraph<BlockId>` containing $n$ confirmed transactions
+
+| N | time (ms) |
+|---|---|
+| 2000 | 2.3 |
+
+---
+
 ## BlockGraph: Main Features
 
 - **Monotone Structure**  
@@ -20,4 +60,4 @@ BlockGraph naturally supports forks and chain reorgs, allowing robust handling o
 
 - **ChangeSet and Update Application**   
 BlockGraph can compute and apply changes as a result of "merging" with an updated chain tip, making it easy to synchronize, update, or roll back the chain as needed.
-BlockGraph can be updated by (and transformed into) a `CheckPoint`, making it interoperable with other types in the BDK ecosystem.
+BlockGraph holds a `CheckPoint` internally, making it interoperable with other types in the BDK ecosystem.
