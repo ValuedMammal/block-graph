@@ -15,9 +15,6 @@ use bitcoin::{hashes::Hash, BlockHash};
 use crate::collections::{BTreeSet, HashMap, HashSet};
 use crate::CheckPoint;
 
-/// Default capacity of the `BlockGraph` if not provided.
-pub const DEFAULT_CAPACITY: usize = 1 << 20;
-
 /// Block graph.
 #[derive(Debug)]
 pub struct BlockGraph<T> {
@@ -93,12 +90,17 @@ impl<T: ToBlockHash + Debug + Ord + Clone> BlockGraph<T> {
         })
     }
 
-    /// Construct from a [`ChangeSet`]. Will be `None` if `changeset` is empty.
+    /// Construct a [`BlockGraph`] from a [`ChangeSet`]. Returns `None` if `changeset` is empty.
+    ///
+    /// This method rebuilds the block graph from a changeset by:
+    /// 1. Finding the genesis block (height 0)
+    /// 2. Building the graph structure with parent-child relationships
+    /// 3. Determining the canonical chain tip
+    /// 4. Constructing the canonical chain by traversing back from the tip
     ///
     /// # Errors
     ///
-    /// `changeset.blocks.first()` must correspond to the "genesis block" or else a
-    /// [`MissingGenesisError`] will occur.
+    /// Returns [`MissingGenesisError`] if no block at height 0 exists in the changeset.
     pub fn from_changeset(changeset: ChangeSet<T>) -> Result<Option<Self>, MissingGenesisError> {
         if changeset.blocks.is_empty() {
             return Ok(None);
@@ -112,8 +114,8 @@ impl<T: ToBlockHash + Debug + Ord + Clone> BlockGraph<T> {
 
         let mut graph = Self::from_genesis(genesis_data.clone());
 
-        // Keep a map of block_hash -> parent(s).
-        let mut parents: HashMap<BlockHash, BTreeSet<BlockId>> = HashMap::new();
+        // Keep a map of block_hash -> parent block IDs for canonical chain reconstruction.
+        let mut block_parents: HashMap<BlockHash, BTreeSet<BlockId>> = HashMap::new();
 
         for (block_id, data, parent_hash) in changeset.blocks {
             let BlockId { height, hash } = block_id;
@@ -122,9 +124,9 @@ impl<T: ToBlockHash + Debug + Ord + Clone> BlockGraph<T> {
             // Record that this hash extends from its parent.
             graph.next_hashes.entry(parent_hash).or_default().insert(hash);
             // `changeset.blocks` is an ordered set, so we will have included the parent already.
-            // Store it in `parents` for reference.
-            if let Some(parent) = graph.block_id(&parent_hash) {
-                parents.entry(hash).or_default().insert(parent);
+            // Store parent-child relationship for canonical chain reconstruction.
+            if let Some(parent_block_id) = graph.block_id(&parent_hash) {
+                block_parents.entry(hash).or_default().insert(parent_block_id);
             }
         }
 
@@ -157,25 +159,26 @@ impl<T: ToBlockHash + Debug + Ord + Clone> BlockGraph<T> {
             return Ok(None);
         };
 
-        // Now that we know the tip we need to populate the canonical chain
-        // by traversing back to the root and collecting block data along
-        // the way.
-        let mut block_data = vec![];
-        let mut cur = Some(best_block.hash);
-        while let Some(hash) = cur {
+        // Now that we know the tip, populate the canonical chain by traversing
+        // back to the root and collecting block data along the way.
+        let mut canonical_block_data = vec![];
+        let mut current_hash = Some(best_block.hash);
+        while let Some(hash) = current_hash {
             // Get block data from graph.
             let (height, data) = match graph.blocks.get(&hash).cloned() {
                 Some(value) => value,
                 None => break,
             };
-            block_data.push((height, data));
-            // Get next parent hash.
-            // The canonical parent is the one with the highest order block id.
-            cur = parents.get(&hash).and_then(|parents| parents.last().map(|id| id.hash));
+            canonical_block_data.push((height, data));
+            // Get the next parent hash for traversal.
+            // The canonical parent is the one with the highest ordered block ID.
+            current_hash = block_parents
+                .get(&hash)
+                .and_then(|parents| parents.last().map(|id| id.hash));
         }
 
         let mut tip = graph.tip.clone();
-        for (height, data) in block_data.into_iter().rev() {
+        for (height, data) in canonical_block_data.into_iter().rev() {
             tip = tip.insert(height, data);
         }
         graph.tip = tip;
@@ -191,26 +194,40 @@ impl<T: ToBlockHash + Debug + Ord + Clone> BlockGraph<T> {
         Ok(Some(graph))
     }
 
-    /// Obtain an initial changeset. The initial changeset represents the difference between `self` and
-    /// an empty [`BlockGraph`].
+    /// Create an initial changeset representing the entire block graph.
+    ///
+    /// This changeset represents the difference between `self` and an empty [`BlockGraph`],
+    /// containing all blocks and their parent relationships needed to reconstruct the graph.
     pub fn initial_changeset(&self) -> ChangeSet<T> {
         let mut changeset = ChangeSet::default();
 
-        for (parent_hash, extends) in &self.next_hashes {
-            for &hash in extends {
-                // Get the orginal block corresponding to `hash`.
-                let (height, data) = self.blocks.get(&hash).cloned().expect("invariant");
-                let id = BlockId { height, hash };
-                changeset.blocks.insert((id, data, *parent_hash));
+        for (parent_hash, child_hashes) in &self.next_hashes {
+            for &block_hash in child_hashes {
+                // Get the original block data corresponding to this block hash.
+                let (height, block_data) = self
+                    .blocks
+                    .get(&block_hash)
+                    .cloned()
+                    .expect("block must exist in graph");
+                let block_id = BlockId {
+                    height,
+                    hash: block_hash,
+                };
+                changeset.blocks.insert((block_id, block_data, *parent_hash));
             }
         }
 
         changeset
     }
 
-    /// Apply update.
+    /// Apply a chain update by integrating new blocks from the given tip.
+    ///
+    /// This method attempts to merge the new chain with the existing graph,
+    /// potentially causing reorganizations if the new chain conflicts with the current tip.
     ///
     /// # Errors
+    ///
+    /// Returns [`CannotConnectError`] if the update cannot be connected to the existing chain.
     pub fn apply_update(&mut self, tip: CheckPoint<T>) -> Result<ChangeSet<T>, CannotConnectError>
     where
         T: ToBlockHash + Copy,
@@ -221,10 +238,10 @@ impl<T: ToBlockHash + Debug + Ord + Clone> BlockGraph<T> {
         )
     }
 
-    /// Applies an iterator of update blocks.
+    /// Apply an update using an iterator of block information.
     ///
-    /// Items of `blocks` represent the block height, block data, and block hash which the update
-    /// connects to.
+    /// Each item in `blocks` represents a tuple of (block_height, block_data, parent_hash)
+    /// where parent_hash is the block this update connects to (None for genesis connection).
     pub fn apply_update_connected_to<I>(
         &mut self,
         blocks: I,
@@ -240,22 +257,24 @@ impl<T: ToBlockHash + Debug + Ord + Clone> BlockGraph<T> {
         Ok(changeset)
     }
 
-    /// Apply changeset. This should be infallible since we only call it after successfully
-    /// merging chains.
+    /// Apply a changeset to the block graph.
+    ///
+    /// This method is infallible since it's only called after successfully merging chains.
+    /// It updates both the block storage and the canonical chain tip.
     fn apply_changeset(&mut self, changeset: ChangeSet<T>, _disconnections: Vec<BlockId>) {
-        // First add blocks to graph.
-        for (BlockId { height, hash }, data, parent_hash) in changeset.blocks.iter() {
-            self.blocks.insert(*hash, (*height, data.clone()));
+        // First, add all new blocks to the graph storage.
+        for (BlockId { height, hash }, block_data, parent_hash) in changeset.blocks.iter() {
+            self.blocks.insert(*hash, (*height, block_data.clone()));
             self.next_hashes.entry(*parent_hash).or_default().insert(*hash);
         }
 
         // Update the canonical chain tip. Any stale conflicts that exist in self.tip
-        // are purged by inserting the new data.
-        let mut new_tip = self.tip.clone();
-        for (BlockId { height, .. }, data, _) in changeset.blocks {
-            new_tip = new_tip.insert(height, data);
+        // are automatically purged by inserting the new block data.
+        let mut updated_tip = self.tip.clone();
+        for (BlockId { height, .. }, block_data, _) in changeset.blocks {
+            updated_tip = updated_tip.insert(height, block_data);
         }
-        self.tip = new_tip;
+        self.tip = updated_tip;
     }
 }
 
@@ -300,7 +319,10 @@ impl<T: ToBlockHash + Debug + Ord + Clone> ChainOracle for BlockGraph<T> {
     }
 }
 
-/// Change set.
+/// A changeset representing modifications to a [`BlockGraph`].
+///
+/// Contains the set of blocks to be added to the graph, along with their parent relationships.
+/// Each block entry is a tuple of (block_id, block_data, parent_hash).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(
     feature = "serde",
@@ -311,9 +333,12 @@ impl<T: ToBlockHash + Debug + Ord + Clone> ChainOracle for BlockGraph<T> {
     ))
 )]
 pub struct ChangeSet<T> {
-    /// The block data, as a set of of (id, data, parent_hash).
+    /// Set of blocks to add to the graph.
     ///
-    /// `T` represents the generic block data, typically something that implements [`ToBlockHash`].
+    /// Each entry is a tuple of (block_id, block_data, parent_hash) where:
+    /// - `block_id`: The block's identifier (height and hash)
+    /// - `block_data`: The generic block data (typically implements [`ToBlockHash`])
+    /// - `parent_hash`: The hash of the block this extends from
     pub blocks: BTreeSet<(BlockId, T, BlockHash)>,
 }
 
@@ -338,35 +363,39 @@ impl<T> BlockGraph<T>
 where
     T: ToBlockHash + Debug + Ord + Copy,
 {
-    /// Merges `update` with `self` and returns the resulting [`ChangeSet`], along with any
-    /// disconnections that occurred.
+    /// Merge an update chain with the current chain and return the resulting changeset.
     ///
-    /// Note, this method finds the changeset between two chains if they *can be merged*, but
-    /// returns without actually modifying `self`.
+    /// This method compares the existing canonical chain with the proposed update chain
+    /// to determine what changes are needed. It returns both the changeset of new blocks
+    /// to add and any blocks that were disconnected due to reorganization.
     ///
-    /// To find the difference between the new chain and the original we iterate over both of them
-    /// from the tip backwards in tandem, only advancing on the higher of the two chains by height
-    /// (or both if equal). The critical logic happens when they have blocks at the same height.
+    /// The merge algorithm:
+    /// 1. Iterates through both chains from tip to genesis
+    /// 2. Advances on the chain with higher block height
+    /// 3. When heights are equal, compares block hashes for conflicts
+    /// 4. Detects reorganizations and finds the point of agreement
+    ///
+    /// Note: This method calculates the merge without modifying `self`.
     ///
     /// # Errors
     ///
-    /// Returns a [`CannotConnectError`] if the chains don't connect, for example if there is
-    /// no point of agreement (and no reorg occurred).
+    /// Returns [`CannotConnectError`] if the chains cannot be connected (no point of agreement
+    /// and no reorganization detected).
     fn merge_chains<I>(&self, update: I) -> Result<(ChangeSet<T>, Vec<BlockId>), CannotConnectError>
     where
         I: Iterator<Item = (u32, T, Option<BlockHash>)>,
     {
-        let mut original_tip = self.tip.iter().peekable();
-        let mut update_tip = update.peekable();
+        let mut original_blocks = self.tip.iter().peekable();
+        let mut update_blocks = update.peekable();
 
         let mut point_of_agreement = None;
-        let mut is_prev_orig_invalid = false;
+        let mut has_reorg_occurred = false;
         let mut potentially_invalid_blocks = vec![];
 
         let mut changeset = ChangeSet::default();
 
         loop {
-            match (original_tip.peek(), update_tip.peek()) {
+            match (original_blocks.peek(), update_blocks.peek()) {
                 // We're done when all updates are processed.
                 (_original, None) => break,
                 // Error if attempting to overwrite the genesis hash.
@@ -377,48 +406,61 @@ where
                     point_of_agreement = Some(update_height);
                     break;
                 }
-                (Some(original), Some(&(update_height, update, parent_hash))) => {
+                (Some(original_checkpoint), Some(&(update_height, update_data, parent_hash))) => {
                     assert!(update_height > 0, "must have non-zero update height");
-                    let parent_hash = parent_hash.unwrap_or_else(|| {
+                    let resolved_parent_hash = parent_hash.unwrap_or_else(|| {
                         self.range(0..update_height)
                             .next()
                             .map(|cp| cp.value().to_blockhash())
                             .expect("range must be non-empty")
                     });
-                    let height = original.height();
-                    let data = original.value();
-                    let original_hash = data.to_blockhash();
-                    let block_id = (height, original_hash).into();
-                    let update_hash = update.to_blockhash();
+                    let original_block_id = original_checkpoint.block_id();
+                    let original_height = original_block_id.height;
+                    let original_hash = original_block_id.hash;
+                    let update_hash = update_data.to_blockhash();
                     let update_block_id = (update_height, update_hash).into();
 
-                    match update_height.cmp(&height) {
-                        // Update height that is not in original.
+                    match update_height.cmp(&original_height) {
+                        // Update block at height not present in original chain.
                         Ordering::Greater => {
-                            changeset.blocks.insert((update_block_id, update, parent_hash));
-                            update_tip.next();
+                            changeset.blocks.insert((
+                                update_block_id,
+                                update_data,
+                                resolved_parent_hash,
+                            ));
+                            update_blocks.next();
                         }
-                        // Original height not in update.
+                        // Original block at height not present in update chain.
                         Ordering::Less => {
-                            potentially_invalid_blocks.push(block_id);
-                            is_prev_orig_invalid = false;
-                            original_tip.next();
+                            potentially_invalid_blocks.push(original_block_id);
+                            has_reorg_occurred = false;
+                            original_blocks.next();
                         }
+                        // Both chains have blocks at same height - compare hashes.
                         Ordering::Equal => {
-                            // Compare block hashes.
                             if update_hash == original_hash {
-                                point_of_agreement = Some(height);
-                                // We may be adding an edge if the parent doesn't exist in graph.
-                                if !self.blocks.contains_key(&parent_hash) {
-                                    changeset.blocks.insert((update_block_id, update, parent_hash));
+                                // Blocks match - this is our point of agreement.
+                                point_of_agreement = Some(original_height);
+                                // Add edge if the parent doesn't exist in graph yet.
+                                if !self.blocks.contains_key(&resolved_parent_hash) {
+                                    changeset.blocks.insert((
+                                        update_block_id,
+                                        update_data,
+                                        resolved_parent_hash,
+                                    ));
                                 }
                             } else {
-                                potentially_invalid_blocks.push(block_id);
-                                is_prev_orig_invalid = true;
-                                changeset.blocks.insert((update_block_id, update, parent_hash));
+                                // Hash mismatch - reorganization detected.
+                                potentially_invalid_blocks.push(original_block_id);
+                                has_reorg_occurred = true;
+                                changeset.blocks.insert((
+                                    update_block_id,
+                                    update_data,
+                                    resolved_parent_hash,
+                                ));
                             }
-                            original_tip.next();
-                            update_tip.next();
+                            original_blocks.next();
+                            update_blocks.next();
                         }
                     }
                 }
@@ -428,16 +470,15 @@ where
             }
         }
 
-        // Fail if no point of agreement is found after traversing blocks of the original chain,
-        // unless there's an explicit invalidation, meaning 1 or more blocks
-        // were reorged.
-        if point_of_agreement.is_none() && !is_prev_orig_invalid {
-            let try_height =
+        // Fail if no point of agreement is found after traversing the original chain,
+        // unless there was an explicit reorganization (invalidation of existing blocks).
+        if point_of_agreement.is_none() && !has_reorg_occurred {
+            let suggested_height =
                 potentially_invalid_blocks.last().copied().unwrap_or(self.tip()).height;
-            return Err(CannotConnectError(try_height));
+            return Err(CannotConnectError(suggested_height));
         }
 
-        let disconnections = if is_prev_orig_invalid {
+        let disconnections = if has_reorg_occurred {
             potentially_invalid_blocks
         } else {
             vec![]
@@ -447,9 +488,12 @@ where
     }
 }
 
-/// Happens when the chain being merged doesn't connect to the parent chain.
+/// Error indicating that a chain update cannot be connected to the existing graph.
 ///
-/// Includes the height of the parent chain that refused the connection.
+/// This occurs when there is no point of agreement between the update chain and the
+/// existing canonical chain, and no reorganization was detected.
+///
+/// Contains the height at which the connection was attempted.
 #[derive(Debug)]
 pub struct CannotConnectError(pub u32);
 
@@ -720,7 +764,7 @@ mod test {
     #[test]
     fn test_merge_chains_evict_two_blocks() {
         // 0-A-B
-        //  -A'
+        // 0-A'
         let genesis_block = BlockId {
             height: 0,
             hash: Hash::hash(b"0"),
@@ -846,8 +890,7 @@ mod test {
 
         let _ = graph.apply_update(cp.clone()).unwrap();
 
-        // Now insert block 1 by applying checkpoint containing heights [0,1,2]
-        // and agreement height = 2
+        // Now insert block 1
         let hash_1 = Hash::hash(b"1");
         cp = cp.insert(1, hash_1);
         let block_1 = BlockId {

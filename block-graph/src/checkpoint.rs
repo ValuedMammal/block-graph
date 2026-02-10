@@ -1,4 +1,8 @@
-//! [`CheckPoint`] is a cheaply cloneable, singly-linked list.
+//! [`CheckPoint`] is a cheaply cloneable, singly-linked list implementation with skip pointers.
+//!
+//! This module implements a skip list-like data structure optimized for blockchain data,
+//! where each checkpoint represents a block at a specific height. The skip pointers
+//! enable efficient traversal and lookup operations.
 
 use alloc::sync::Arc;
 use alloc::vec;
@@ -10,37 +14,50 @@ use bdk_chain::{bitcoin, BlockId, ToBlockHash};
 use bitcoin::BlockHash;
 
 // TODO:
-// - Implement Node::skip
-// - Improve `get` efficiency
-// - Add Node::index that stores the numeric index of a checkpoint starting from 0
-// - Change to `get_skip_index` (instead of height), since in a "sparse" chain we can't assume that all heights are present
+// - `range` could be improved to utilize fast search to the end bound
 // - As we're now tracking the index, we should be able to implement `CheckPoint::len` for free
-// - `range` could be improve to utilize fast search to the end bound
-// - Store the blockhash inside Node, to avoid continually re-hashing
 
-/// CheckPoint, guaranteed to have at least 1 element.
+/// A checkpoint in the blockchain, representing a linked list node with skip pointers.
+///
+/// CheckPoint is guaranteed to have at least one element and provides efficient
+/// traversal through both sequential (prev) and skip pointers for faster lookups.
+/// Each checkpoint contains block data and maintains connections to previous blocks.
 #[derive(Debug)]
 pub struct CheckPoint<T>(pub(crate) Arc<Node<T>>);
 
-/// Node containing both a key and value. The key is referred to as `height`.
+/// Internal node structure for the CheckPoint linked list.
+///
+/// Contains the block data along with pointers for efficient traversal:
+/// - `prev`: Points to the immediately previous block in the chain
+/// - `skip`: Points to a block further back, enabling logarithmic-time lookups
+/// - `index`: The position of this node in the chain (0-based)
 #[derive(Debug)]
 pub(crate) struct Node<T> {
+    /// Block height (also used as the key for ordering)
     pub height: u32,
+    /// Block hash for this checkpoint
     pub hash: BlockHash,
+    /// The generic block data
     pub value: T,
+    /// Pointer to the immediately previous node in the chain
     pub prev: Option<Arc<Node<T>>>,
-    // pointer to a Node further back
+    /// Skip pointer to a node further back, enabling fast traversal
     pub skip: Option<Arc<Node<T>>>,
+    /// 0-based index of this node in the chain
     pub index: usize,
 }
 
 impl<T> Drop for Node<T> {
+    /// Custom drop implementation to prevent stack overflow on deeply nested chains.
+    ///
+    /// Iteratively drops nodes to avoid recursive destruction that could
+    /// cause stack overflow on long chains.
     fn drop(&mut self) {
-        let mut current = self.prev.take();
-        while let Some(node) = current {
+        let mut current_node = self.prev.take();
+        while let Some(node) = current_node {
             match Arc::into_inner(node) {
                 Some(mut node) => {
-                    current = node.prev.take();
+                    current_node = node.prev.take();
                 }
                 None => break,
             }
@@ -52,7 +69,10 @@ impl<T> CheckPoint<T>
 where
     T: Debug + ToBlockHash,
 {
-    /// Start a new list with `value` at the head.
+    /// Create a new CheckPoint starting a new chain with the given block data.
+    ///
+    /// This creates the genesis checkpoint at the specified height with the provided value.
+    /// The resulting checkpoint will have index 0 and no skip or prev pointers.
     pub fn new(height: u32, value: T) -> Self {
         Self(Arc::new(Node {
             height,
@@ -64,33 +84,56 @@ where
         }))
     }
 
-    /// Construct from an iterator of (height, value) entries.
+    /// Construct a CheckPoint chain from an iterator of (height, value) entries.
+    ///
+    /// The entries must be provided in ascending height order. Returns an error
+    /// if the iterator is empty or if heights are not strictly increasing.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(None)` if the iterator is empty, or `Err(Some(checkpoint))`
+    /// if the heights are not in strictly increasing order.
     pub fn from_entries<I>(entries: I) -> Result<Self, Option<Self>>
     where
         I: IntoIterator<Item = (u32, T)>,
     {
-        let mut entries = entries.into_iter();
-        let (k, v) = entries.next().ok_or(None)?;
-        let cp = Self::new(k, v);
+        let mut entry_iter = entries.into_iter();
+        let (initial_height, initial_value) = entry_iter.next().ok_or(None)?;
+        let checkpoint = Self::new(initial_height, initial_value);
 
-        Ok(cp.extend(entries)?)
+        Ok(checkpoint.extend(entry_iter)?)
     }
 
-    /// Extend with an iterator of (height, value) entries.
+    /// Extend the checkpoint chain with additional (height, value) entries.
+    ///
+    /// All entries must have heights strictly greater than the current tip.
+    /// This method processes entries sequentially, building the chain forward.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original checkpoint if any entry has a height not strictly
+    /// greater than the previous entry.
     pub fn extend<I>(self, items: I) -> Result<Self, Self>
     where
         I: IntoIterator<Item = (u32, T)>,
     {
-        let mut cp = self;
-        for (k, v) in items.into_iter() {
-            cp = cp.push(k, v)?;
+        let mut checkpoint = self;
+        for (entry_height, entry_value) in items.into_iter() {
+            checkpoint = checkpoint.push(entry_height, entry_value)?;
         }
-        Ok(cp)
+        Ok(checkpoint)
     }
 
-    /// Push a `T` value onto the head of the list.
+    /// Add a new block to the front of the checkpoint chain.
     ///
-    /// Error if the height is not strictly greater than self.
+    /// Creates a new checkpoint with the given height and value, linking it to
+    /// the current chain. The new checkpoint becomes the new tip of the chain.
+    /// Skip pointers are automatically calculated for efficient traversal.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original checkpoint unchanged if the new height is not
+    /// strictly greater than the current tip height.
     pub fn push(self, height: u32, value: T) -> Result<Self, Self> {
         if self.height() >= height {
             return Err(self);
@@ -98,10 +141,10 @@ where
 
         let new_index = self.0.index + 1;
 
-        // Calculate skip pointer using index-based logic
-        let skip_index = get_skip_index(new_index);
-        let skip_node = self.get_index(skip_index).map(|cp| cp.0);
-        debug_assert!(skip_node.is_some(), "Each new node must have a skip");
+        // Calculate skip pointer using index-based logic for efficient lookups
+        let skip_target_index = get_skip_index(new_index);
+        let skip_node = self.get_index(skip_target_index).map(|checkpoint| checkpoint.0);
+        debug_assert!(skip_node.is_some(), "Each new node must have a skip pointer");
 
         let node = Node {
             height,
@@ -115,74 +158,97 @@ where
         Ok(Self(Arc::new(node)))
     }
 
-    /// Insert.
+    /// Insert or replace a block at the specified height in the chain.
     ///
-    /// Note this allows replacing the value of an entry. This panics if the caller attempts to
-    /// replace the root of the current list.
+    /// This method allows inserting a block at any valid height, potentially
+    /// reorganizing the chain. If a block already exists at the given height:
+    /// - If the value is identical, returns the original chain unchanged
+    /// - If the value differs, replaces it and invalidates all subsequent blocks
+    ///
+    /// # Panics
+    ///
+    /// Panics if attempting to replace the root (genesis) block of the chain.
     pub fn insert(self, height: u32, value: T) -> Self
     where
         T: Clone + PartialEq,
     {
-        let mut cur = self.clone();
-        let mut tail = vec![];
+        let mut current_checkpoint = self.clone();
+        let mut tail_blocks = vec![];
 
-        // Look for the next nearest node smaller than the given height.
-        let base = loop {
-            if cur.height() == height {
-                if cur.value() == value {
+        // Traverse backwards to find the insertion point
+        let base_checkpoint = loop {
+            if current_checkpoint.height() == height {
+                if current_checkpoint.value() == value {
+                    // Value is identical, no change needed
                     return self;
                 }
-                // If we're replacing a value, the tail is by implication invalid.
-                tail = vec![];
-                break cur.prev().expect("cannot replace root");
+                // Replacing existing value invalidates the tail
+                tail_blocks = vec![];
+                break current_checkpoint.prev().expect("cannot replace genesis block");
             }
-            // We found our base.
-            if cur.height() < height {
-                break cur;
+            // Found our insertion base
+            if current_checkpoint.height() < height {
+                break current_checkpoint;
             }
-            tail.push((cur.height(), cur.value()));
-            cur = cur.prev().expect("will break before root");
+            // Collect blocks that will be re-added after insertion
+            tail_blocks.push((current_checkpoint.height(), current_checkpoint.value()));
+            current_checkpoint = current_checkpoint.prev().expect("will break before root");
         };
 
-        base.extend(core::iter::once((height, value)).chain(tail.into_iter().rev()))
-            .expect("tail must be in order")
+        base_checkpoint
+            .extend(core::iter::once((height, value)).chain(tail_blocks.into_iter().rev()))
+            .expect("tail blocks must be in ascending height order")
     }
 
-    /// Range.
+    /// Create an iterator over checkpoints within the specified height range.
+    ///
+    /// Returns checkpoints in descending height order (tip to genesis direction)
+    /// that fall within the given range bounds. Supports all standard range types.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Get checkpoints between heights 10 and 20 (inclusive)
+    /// for cp in checkpoint.range(10..=20) {
+    ///     println!("Height: {}", cp.height());
+    /// }
+    /// ```
     pub fn range(&self, range: impl RangeBounds<u32>) -> impl Iterator<Item = CheckPoint<T>> {
         let start_bound = range.start_bound().cloned();
         let end_bound = range.end_bound().cloned();
         self.iter()
-            .skip_while(move |cp| match end_bound {
-                core::ops::Bound::Included(included) => cp.height() > included,
-                core::ops::Bound::Excluded(excluded) => cp.height() >= excluded,
+            .skip_while(move |checkpoint| match end_bound {
+                core::ops::Bound::Included(included) => checkpoint.height() > included,
+                core::ops::Bound::Excluded(excluded) => checkpoint.height() >= excluded,
                 core::ops::Bound::Unbounded => false,
             })
-            .take_while(move |cp| match start_bound {
-                core::ops::Bound::Included(included) => cp.height() >= included,
-                core::ops::Bound::Excluded(excluded) => cp.height() > excluded,
+            .take_while(move |checkpoint| match start_bound {
+                core::ops::Bound::Included(included) => checkpoint.height() >= included,
+                core::ops::Bound::Excluded(excluded) => checkpoint.height() > excluded,
                 core::ops::Bound::Unbounded => true,
             })
     }
 }
 
 impl<T> CheckPoint<T> {
-    /// Prev.
+    /// Get the immediately previous checkpoint in the chain.
+    ///
+    /// Returns `None` if this is the genesis checkpoint (root of the chain).
     pub fn prev(&self) -> Option<Self> {
         self.0.prev.clone().map(Self)
     }
 
-    /// Height.
+    /// Get the block height of this checkpoint.
     pub fn height(&self) -> u32 {
         self.0.height
     }
 
-    /// Hash.
+    /// Get the block hash of this checkpoint.
     pub fn hash(&self) -> BlockHash {
         self.0.hash
     }
 
-    /// BlockId.
+    /// Get the BlockId (height + hash) for this checkpoint.
     pub fn block_id(&self) -> BlockId {
         BlockId {
             height: self.0.height,
@@ -190,7 +256,7 @@ impl<T> CheckPoint<T> {
         }
     }
 
-    /// Value.
+    /// Get a clone of the block data stored in this checkpoint.
     pub fn value(&self) -> T
     where
         T: Clone,
@@ -198,49 +264,71 @@ impl<T> CheckPoint<T> {
         self.0.value.clone()
     }
 
-    /// Return the skip CheckPoint of this CheckPoint.
+    /// Get the skip pointer checkpoint for efficient backward traversal.
+    ///
+    /// The skip pointer points to a checkpoint further back in the chain,
+    /// enabling logarithmic-time lookups. Returns `None` for the genesis block.
     fn skip(&self) -> Option<Self> {
         self.0.skip.clone().map(Self)
     }
 
-    /// Get the current index of this checkpoint.
+    /// Get the 0-based index of this checkpoint in the chain.
+    ///
+    /// The genesis block has index 0, and each subsequent block increments the index.
     pub fn index(&self) -> usize {
         self.0.index
     }
 
-    /// Whether `self` and `other` share the same underlying pointer.
+    /// Check if two checkpoints share the same underlying memory allocation.
+    ///
+    /// This is more efficient than value equality checking when you need to
+    /// test if two checkpoint references point to the exact same node.
     pub fn eq_ptr(&self, other: &Self) -> bool {
         Arc::as_ptr(&self.0) == Arc::as_ptr(&other.0)
     }
 
-    /// Iter.
+    /// Create an iterator that traverses the checkpoint chain from tip to genesis.
+    ///
+    /// The iterator yields checkpoints in descending height order, starting from
+    /// this checkpoint and following prev pointers back to the genesis.
     pub fn iter(&self) -> CheckPointIter<T> {
         CheckPointIter {
             cur: Some(self.0.clone()),
         }
     }
 
-    /// Get the [`CheckPoint`] at the given `height` if it exists.
+    /// Look up a checkpoint at the specified height using skip pointers.
+    ///
+    /// This method uses the skip list structure for efficient lookups, providing
+    /// O(log n) average performance instead of O(n) linear traversal.
+    ///
+    /// Returns `None` if no checkpoint exists at the requested height or if
+    /// the height is greater than this checkpoint's height.
     pub fn get(&self, height: u32) -> Option<Self> {
         if height > self.height() {
             return None;
         }
-        let mut current = self.clone();
-        while current.height() > height {
-            current = if let Some(skip_cp) = current.skip() {
-                if skip_cp.height() >= height {
-                    skip_cp
+        let mut current_checkpoint = self.clone();
+        while current_checkpoint.height() > height {
+            current_checkpoint = if let Some(skip_checkpoint) = current_checkpoint.skip() {
+                if skip_checkpoint.height() >= height {
+                    skip_checkpoint
                 } else {
-                    current.prev()?
+                    current_checkpoint.prev()?
                 }
             } else {
-                current.prev()?
+                current_checkpoint.prev()?
             };
         }
-        (current.height() == height).then_some(current)
+        (current_checkpoint.height() == height).then_some(current_checkpoint)
     }
 
-    /// Get the [`CheckPoint`] at the given `index` if it exists.
+    /// Look up a checkpoint at the specified index using skip pointers.
+    ///
+    /// This is an internal method that uses skip pointers to efficiently
+    /// navigate to a checkpoint at a specific 0-based index position.
+    ///
+    /// Returns `None` if the target index is greater than this checkpoint's index.
     fn get_index(&self, target_index: usize) -> Option<Self> {
         if target_index > self.0.index {
             return None;
@@ -277,48 +365,71 @@ impl<T> Clone for CheckPoint<T> {
 }
 
 impl<T: fmt::Debug + Clone + PartialEq> PartialEq for CheckPoint<T> {
+    /// Compare two checkpoint chains for value equality.
+    ///
+    /// Two chains are equal if they contain the same sequence of (height, value) pairs,
+    /// regardless of their internal pointer structure.
     fn eq(&self, other: &Self) -> bool {
         self.iter()
-            .map(|cp| (cp.height(), cp.value()))
-            .eq(other.iter().map(|cp| (cp.height(), cp.value())))
+            .map(|checkpoint| (checkpoint.height(), checkpoint.value()))
+            .eq(other
+                .iter()
+                .map(|checkpoint| (checkpoint.height(), checkpoint.value())))
     }
 }
 
-/// CheckPoint iter.
+/// Iterator for traversing a CheckPoint chain from tip to genesis.
+///
+/// Yields checkpoints in descending height order by following prev pointers.
 pub struct CheckPointIter<T> {
+    /// Current node being processed (None when iteration is complete)
     cur: Option<Arc<Node<T>>>,
 }
 
 impl<T> Iterator for CheckPointIter<T> {
     type Item = CheckPoint<T>;
 
+    /// Get the next checkpoint in the chain (moving toward genesis).
     fn next(&mut self) -> Option<Self::Item> {
-        let cur = self.cur.clone()?;
-        self.cur.clone_from(&cur.prev);
+        let current_node = self.cur.clone()?;
+        self.cur.clone_from(&current_node.prev);
 
-        Some(CheckPoint(cur))
+        Some(CheckPoint(current_node))
     }
 }
 
-/// Flips the lowest bit of `n` from 1 to 0 and returns the result.
+/// Clear the lowest set bit in the given number.
+///
+/// This is a bit manipulation utility used in skip list index calculations.
+/// For example: `invert_lowest_1(6)` (binary 110) returns 4 (binary 100).
 fn invert_lowest_1(n: i32) -> i32 {
     n & (n - 1)
 }
 
-/// Compute what index to jump back to with the skip pointer.
-/// ref: `GetSkipHeight` <https://github.com/bitcoin/bitcoin/blob/2d6426c296ea43e62980d87d94fde0e94318a341/src/chain.cpp#L83>
+/// Calculate the target index for the skip pointer at the given index.
+///
+/// This function implements the skip list algorithm used in Bitcoin Core's chain indexing.
+/// It ensures that skip pointers create an efficient logarithmic lookup structure.
+///
+/// The algorithm:
+/// - For even indices: Clear the lowest set bit
+/// - For odd indices: Apply the even algorithm to (index - 1) then add 1
+///
+/// Reference: `GetSkipHeight` in Bitcoin Core
+/// <https://github.com/bitcoin/bitcoin/blob/2d6426c296ea43e62980d87d94fde0e94318a341/src/chain.cpp#L83>
 fn get_skip_index(index: usize) -> usize {
     if index < 2 {
         return 0;
     }
-    let n = index as i32;
-    let ret = if n & 1 == 0 {
-        invert_lowest_1(n)
+    let index = index as i32;
+    let skip_index = if index & 1 == 0 {
+        // Even case: clear lowest set bit
+        invert_lowest_1(index)
     } else {
-        // Handle odd case separately
-        invert_lowest_1(invert_lowest_1(n - 1)) + 1
+        // Odd case: apply even algorithm to (index - 1) then add 1
+        invert_lowest_1(invert_lowest_1(index - 1)) + 1
     };
-    ret.try_into().expect("n should be >= 0")
+    skip_index.try_into().expect("skip index should be non-negative")
 }
 
 #[cfg(test)]
@@ -329,26 +440,26 @@ mod test {
 
     #[test]
     fn test_get_with_100_elements() {
-        let hash_0 = BlockHash::all_zeros();
-        let mut cp = CheckPoint::new(0, hash_0);
-        let mut expected_values = vec![hash_0];
+        let genesis_hash = BlockHash::all_zeros();
+        let mut checkpoint = CheckPoint::new(0, genesis_hash);
+        let mut expected_values = vec![genesis_hash];
 
         for height in 1u32..100 {
-            let value: BlockHash = Hash::hash(height.to_be_bytes().as_slice());
-            expected_values.push(value);
-            cp = cp.push(height, value).unwrap();
+            let block_hash: BlockHash = Hash::hash(height.to_be_bytes().as_slice());
+            expected_values.push(block_hash);
+            checkpoint = checkpoint.push(height, block_hash).unwrap();
         }
 
         // Test getting elements at various heights
         for test_height in 0..100 {
-            let result_cp = cp.get(test_height).expect("cp should exist");
-            assert_eq!(result_cp.height(), test_height);
-            assert_eq!(result_cp.value(), expected_values[test_height as usize]);
+            let result_checkpoint = checkpoint.get(test_height).expect("checkpoint should exist");
+            assert_eq!(result_checkpoint.height(), test_height);
+            assert_eq!(result_checkpoint.value(), expected_values[test_height as usize]);
         }
 
         // Test getting non-existent heights
-        assert!(cp.get(100).is_none(), "height 100 should not exist");
-        assert!(cp.get(150).is_none(), "height 150 should not exist");
+        assert!(checkpoint.get(100).is_none(), "height 100 should not exist");
+        assert!(checkpoint.get(150).is_none(), "height 150 should not exist");
     }
 
     #[test]
@@ -378,93 +489,110 @@ mod test {
 
     #[test]
     fn test_skip_height_validity() {
-        let mut cp = CheckPoint::new(0, BlockHash::all_zeros());
+        let mut checkpoint = CheckPoint::new(0, BlockHash::all_zeros());
 
         for height in 1u32..100 {
-            let value: BlockHash = Hash::hash(height.to_be_bytes().as_slice());
-            cp = cp.push(height, value).unwrap();
+            let block_hash: BlockHash = Hash::hash(height.to_be_bytes().as_slice());
+            checkpoint = checkpoint.push(height, block_hash).unwrap();
         }
 
         // For each node verify that a skip pointer exists and points to a node
         // with a smaller height that is further back in the chain
         for height in 1..100 {
-            let test_cp = cp.get(height).expect("checkpoint should exist");
-            let skip_cp = test_cp.skip().expect("every non-zero node should have a skip");
-            println!("height={}, skip_cp_height={}", height, skip_cp.height());
+            let test_checkpoint = checkpoint.get(height).expect("checkpoint should exist");
+            let skip_checkpoint = test_checkpoint
+                .skip()
+                .expect("every non-zero node should have a skip pointer");
+            println!(
+                "height={}, skip_checkpoint_height={}",
+                height,
+                skip_checkpoint.height()
+            );
             assert!(
-                skip_cp.height() < height,
-                "skip_cp height must be less than current cp height"
+                skip_checkpoint.height() < height,
+                "skip checkpoint height must be less than current checkpoint height"
             );
         }
     }
 
     #[test]
     fn test_skip_index_validity() {
-        let init_height = 0;
-        let mut cp = CheckPoint::<BlockHash>::new(init_height, BlockHash::all_zeros());
+        let initial_height = 0;
+        let mut checkpoint = CheckPoint::<BlockHash>::new(initial_height, BlockHash::all_zeros());
 
         // Create sparse chain where heights are multiples of 50
         for i in 1..20 {
             let height: u32 = 50 * (i as u32);
-            let value: BlockHash = Hash::hash(height.to_be_bytes().as_slice());
-            cp = cp.push(height, value).unwrap();
+            let block_hash: BlockHash = Hash::hash(height.to_be_bytes().as_slice());
+            checkpoint = checkpoint.push(height, block_hash).unwrap();
         }
 
         // For each node verify that a skip pointer exists and points to a node
         // with a smaller height that is further back in the chain
         for index in 0..20 {
-            let result_cp = cp.get_index(index).expect("checkpoint should exist");
-            assert_eq!(result_cp.index(), index, "indices must increment sequentially");
+            let result_checkpoint = checkpoint.get_index(index).expect("checkpoint should exist");
+            assert_eq!(result_checkpoint.index(), index, "indices must increment sequentially");
             if index == 0 {
-                assert_eq!(result_cp.height(), init_height, "initial height must be index 0");
-                assert!(result_cp.skip().is_none(), "index 0 cp should not have skip");
-            }
-            let height = result_cp.height();
-            let skip_cp = result_cp.skip();
-            if index > 0 {
-                assert!(skip_cp.is_some(), "each non-zero index must have a skip");
-            }
-            let skip_cp_height = skip_cp.as_ref().map(CheckPoint::height);
-            if let Some(skip_cp_height) = skip_cp_height {
+                assert_eq!(
+                    result_checkpoint.height(),
+                    initial_height,
+                    "initial height must be at index 0"
+                );
                 assert!(
-                    cp.get(skip_cp_height).is_some(),
-                    "skip_cp height must exist in the chain"
+                    result_checkpoint.skip().is_none(),
+                    "index 0 checkpoint should not have skip pointer"
+                );
+            }
+            let height = result_checkpoint.height();
+            let skip_checkpoint = result_checkpoint.skip();
+            if index > 0 {
+                assert!(
+                    skip_checkpoint.is_some(),
+                    "each non-zero index must have a skip pointer"
+                );
+            }
+            let skip_checkpoint_height = skip_checkpoint.as_ref().map(CheckPoint::height);
+            if let Some(skip_height) = skip_checkpoint_height {
+                assert!(
+                    checkpoint.get(skip_height).is_some(),
+                    "skip checkpoint height must exist in the chain"
                 );
             }
             assert!(
-                skip_cp_height < Some(height),
-                "skip_cp height must be less than current cp height"
+                skip_checkpoint_height < Some(height),
+                "skip checkpoint height must be less than current checkpoint height"
             );
             println!(
-                "index={}, height={}, skip_cp_height={:?}",
-                index, height, skip_cp_height,
+                "index={}, height={}, skip_checkpoint_height={:?}",
+                index, height, skip_checkpoint_height,
             );
         }
     }
 
     #[test]
     fn test_index_with_non_contiguous_heights() {
-        let test_value = BlockHash::all_zeros();
-        let mut cp = CheckPoint::new(0, test_value);
-        assert_eq!(cp.get_index(0).unwrap(), cp);
+        let test_block_hash = BlockHash::all_zeros();
+        let mut checkpoint = CheckPoint::new(0, test_block_hash);
+        assert_eq!(checkpoint.get_index(0).unwrap(), checkpoint);
 
         let test_heights = [10, 25, 100, 500];
 
-        // Push some checkpoints with non-contiguous heights (sparse)
+        // Push some checkpoints with non-contiguous heights (sparse chain)
         for height in test_heights {
-            cp = cp.push(height, test_value).unwrap();
+            checkpoint = checkpoint.push(height, test_block_hash).unwrap();
         }
 
-        assert!(cp.skip().is_some(), "head should have skip pointer");
+        assert!(checkpoint.skip().is_some(), "head should have skip pointer");
 
         // Test `get` at expected heights
-        for (expect_index, expect_height) in (1..).zip(test_heights) {
-            let result_cp = cp.get(expect_height).expect("checkpoint 0 should exist");
-            assert_eq!(result_cp.height(), expect_height);
-            assert_eq!(result_cp.index(), expect_index);
+        for (expected_index, expected_height) in (1..).zip(test_heights) {
+            let result_checkpoint =
+                checkpoint.get(expected_height).expect("checkpoint should exist");
+            assert_eq!(result_checkpoint.height(), expected_height);
+            assert_eq!(result_checkpoint.index(), expected_index);
         }
 
-        // Test non-existent index
-        assert!(cp.get(11).is_none(), "height 11 should not exist");
+        // Test non-existent height
+        assert!(checkpoint.get(11).is_none(), "height 11 should not exist");
     }
 }
