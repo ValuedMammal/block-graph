@@ -4,23 +4,17 @@
 
 To reproduce:
 ```
-cargo bench -p block_graph --bench block_graph_checkpoint
-cargo bench -p block_graph --bench from_changeset
-cargo bench -p block_graph --bench canonical_view
+cargo bench -p block_graph
 ```
 
 ### Time to search for a middle entry in a `CheckPoint<BlockHash>` containing $n$ elements
 
-<!-- branch: feat/blockgraph_checkpoint -->
-
-<!-- TODO: syntax for exponent -->
-
 | N | time (ns) |
 |---|---|
-| 2<sup>17</sup> | 18.6 |
-| 2<sup>18</sup> | 19.1 |
-| 2<sup>19</sup> | 20.4 |
-| 2<sup>20</sup> | 20.5 |
+| 2<sup>17</sup> | 19.0 |
+| 2<sup>18</sup> | 19.0 |
+| 2<sup>19</sup> | 20.7 |
+| 2<sup>20</sup> | 20.8 |
 
 ---
 
@@ -32,13 +26,31 @@ cargo bench -p block_graph --bench canonical_view
 
 ---
 
-### Time to canonicalize a `TxGraph<BlockId>` containing $n$ confirmed transactions
+### Time to find result of `BlockGraph::is_block_in_chain` for a given query height
 
-| N | time (ms) |
-|---|---|
-| 2000 | 2.3 |
+| N | query | time (ns) |
+|---|---|---|
+| 50,000 | 13 | 180 |
 
 ---
+
+### Time to apply update to `BlockGraph<BlockHash>`
+
+| N | time (us) |
+|---|---|
+| 1000 | 72 |
+
+---
+
+### 100 block reorg test for `BlockGraph<Header>`
+
+| N | time (us) |
+|---|---|
+| 100 | 128 |
+
+---
+
+<!-- Benchmark `range` -->
 
 ## BlockGraph: Main Features
 
