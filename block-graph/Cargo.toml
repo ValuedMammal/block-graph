@@ -5,6 +5,27 @@ edition = "2021"
 rust-version = "1.85.0"
 readme = "README.md"
 
+
+[[bench]]
+name = "checkpoint"
+harness = false
+
+[[bench]]
+name = "apply_update"
+harness = false
+
+[[bench]]
+name = "from_changeset"
+harness = false
+
+[[bench]]
+name = "is_block_in_chain"
+harness = false
+
+[[bench]]
+name = "reorg"
+harness = false
+
 [dependencies]
 bdk_chain = { git = "https://github.com/bitcoindevkit/bdk", rev = "abe121d0445aa1de848bfa335ee0204fabeb5d17" }
 serde = { version = "1", default-features = false, features = ["derive"], optional = true }
@@ -19,15 +40,3 @@ path = "."
 
 [dev-dependencies]
 criterion = "0.2"
-
-[[bench]]
-name = "block_graph_checkpoint"
-harness = false
-
-[[bench]]
-name = "from_changeset"
-harness = false
-
-[[bench]]
-name = "canonical_view"
-harness = false
