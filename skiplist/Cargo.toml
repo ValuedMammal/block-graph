@@ -9,7 +9,7 @@ rust-version = "1.85.0"
 rand = "0.8"
 
 [dev-dependencies]
-bdk_chain = { git = "https://github.com/bitcoindevkit/bdk", rev = "be356d5fda56ca01d3540d767e1566559092c4d0" }
+bdk_chain = { git = "https://github.com/bitcoindevkit/bdk", rev = "abe121d0445aa1de848bfa335ee0204fabeb5d17" }
 criterion = { version = "0.2" }
 
 [[bench]]
