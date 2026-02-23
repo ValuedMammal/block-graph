@@ -73,3 +73,5 @@ BlockGraph naturally supports forks and chain reorgs, allowing robust handling o
 - **ChangeSet and Update Application**   
 BlockGraph can compute and apply changes as a result of "merging" with an updated chain tip, making it easy to synchronize, update, or roll back the chain as needed.
 BlockGraph holds a `CheckPoint` internally, making it interoperable with other types in the BDK ecosystem.
+
+For an explanation of specific design choices see [`rationale.md`](doc/rationale.md).

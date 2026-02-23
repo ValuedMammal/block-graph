@@ -17,27 +17,15 @@ This enables forks and branches to occur, which happen naturally in a distribute
 
 Statistically it's more performant (due to having a stack of linked lists enabling us to "skip" over large sections of the list at higher levels), at the cost of potentially more memory (since we're now dealing with a stack of linked lists instead of only one).
 
-**Why is the use of `unsafe` pervasive throughout the `node` module?**
+The skiplist isn't a hard requirement of BlockGraph, per se, but the attractive performance profile may help to facilitate adoption.
 
-The use of `unsafe` is used to break the lifetime constraint on `&self` when calling methods on Node and is only necessary when traversing nodes of the skiplist. The unsafety is contained within a safe API, meaning that if implemented properly, a user of SkipList should never run the risk of undefined behavior. In fact this is a common theme in the rust standard library with collections such as `LinkedList` and `Vec`.
+**Alternatives**
 
-For example:
+Some alternatives have been considered for implementing a skiplist, discussed here
 
-The function `advance_while_mut` intends to return a `&mut` reference to `Node`. To do so, we need to continuously compare two adjacent nodes (by reference) to decide whether to advance.
-
-The problem is that we can't hold a shared reference and an exclusive reference to `self` simultaneously (even though we never mutate a value before the method returns). In safe rust, a reference to a local variable isn't allowed to escape the scope of its referent. Normally this makes sense to prevent pointers from dangling, etc, however we make an exception in order to use a method like `advance_while_mut`, and we guarantee its safety by ensuring that instances of Node always begin as a pointer that is non-null and properly aligned (the pointer always points to a valid Node instance).
-
-We get around this limitation by reinterpreting a value of `Node` through the use of raw pointers in order to obtain a unique reference with a lifetime that can expand to the scope in which it is used, i.e. an [unbounded lifetime](<https://doc.rust-lang.org/nomicon/unbounded-lifetimes.html#unbounded-lifetimes>). In addition the `Node` type is never exposed outside of the library, so the scope of any reference to Node cannot outlive the SkipList itself.
-
-**The CheckPoint type is cheaply cloneable and thread safe, meaning we can pass around a reference to the chain tip, query it from multiple threads, and so on. Why can't SkipList be more like CheckPoint?**
-
-The reason we're able to do this with CheckPoint is that CheckPoint just wraps a `CPInner`, that is, it is functionally equivalent to the inner node structure. Perhaps surprisingly, iterating a CheckPoint yields items of... well, CheckPoint. But unlike a checkpoint, `SkipList<T>` when iterated does not yield items of itself, rather it yields items of `&(u32, T)`. This is analogous to getting the height (`u32`) and block data (`T`) from a `CheckPoint<T>`.
-
-As a high level data structure SkipList does not behave like any other Node, because it contains extra information related to the levels and capacity, it holds a pointer to the head node, as well as the logic of level generation (`rng`). On the plus side, we can convert the canonical chain of BlockGraph into a CheckPoint if we choose (a singly linked list is enough if all we need is to iterate blocks from the tip), allowing us to pass it directly to a chain source just as you would when updating a LocalChain.
-
-**Alternatives?**
-
-The implementation of BlockGraph is largely inspired by [JP-Ellis/rust-skiplist](<https://github.com/JP-Ellis/rust-skiplist/>) which was chosen because of its relative popularity on crates.io. Other implementations that have been considered are... TODO
+- [`JP-Ellis/rust-skiplist`](https://github.com/JP-Ellis/rust-skiplist) Pure rust implementation of a skiplist. We decided against using this or developing an in-house solution because it is thought that similar performance can be achieved by adding the necessary features to the existing `CheckPoint` type.
+- [`crossbeam-skiplist`](https://github.com/crossbeam-rs/crossbeam/tree/master/crossbeam-skiplist). Skiplist implementation that features lock-free concurrency based on ["epoch-based memory reclamation"](https://github.com/crossbeam-rs/crossbeam/blob/master/crossbeam-epoch/src/lib.rs), aka garbage collection. Looks promising as a dependency but probably not worth the effort of reimplementing the thing from scratch.
+- ☑️ Achieve skiplist-like behavior by adding additional pointers to the `Node` structure in a singly linked list. This is mostly inpired by Bitcoin Core's [`CBlockIndex`](https://github.com/bitcoin/bitcoin/blob/v29.2/src/chain.h#L140) class. It's a novel approach for looking up historical block data in logarithmic time.
 
 ## Glossary of terms
 
