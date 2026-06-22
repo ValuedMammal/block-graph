@@ -234,8 +234,8 @@ impl<T: ToBlockHash + Debug + Ord + Clone> BlockGraph<T> {
     }
 
     /// Iterate over `(height, blockhash, value)` tuples in the [`BlockGraph`] starting from the given [`BlockHash`].
-    fn iter_block_graph(&self, from: BlockHash) -> impl Iterator<Item = (u32, BlockHash, T)> + '_ {
-        let mut current_hash = Some(from);
+    fn iter_block_graph(&self, hash: BlockHash) -> impl Iterator<Item = (u32, BlockHash, T)> + '_ {
+        let mut current_hash = Some(hash);
 
         core::iter::from_fn(move || {
             let hash = current_hash?;
