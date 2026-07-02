@@ -5,10 +5,11 @@ alias b := build
 alias f := fmt
 alias c := check
 alias t := test
+alias tn := test-name
 
 # Build workspace
 build:
-    cargo build --workspace
+    cargo build --workspace --all-targets --all-features
 
 # Rustfmt
 fmt:
@@ -26,12 +27,10 @@ test-name name="":
 
 # Run block-graph unit tests
 test:
-    cargo test -p block_graph --no-fail-fast --all-features --lib -- checkpoint::test
     cargo test -p block_graph --no-fail-fast --all-features --lib -- block_graph::test
 
 # Run block-graph benchmarks
 bench:
-    cargo bench -p block_graph --bench checkpoint
     cargo bench -p block_graph --bench from_changeset
     cargo bench -p block_graph --bench is_block_in_chain
     cargo bench -p block_graph --bench apply_update
