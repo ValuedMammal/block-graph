@@ -5,7 +5,6 @@ use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
 
 use bdk_chain::bitcoin;
-use bdk_chain::BlockId;
 
 const CT: u32 = 1000;
 
@@ -20,8 +19,7 @@ fn bench_apply_update(c: &mut Criterion) {
     for i in 0..CT {
         let height = i;
         let hash = Hash::hash(height.to_string().as_bytes());
-        let block_id = BlockId { height, hash };
-        changeset.blocks.insert((block_id, hash, prev_hash));
+        changeset.blocks.insert(hash, (height, hash, prev_hash));
         prev_hash = hash;
     }
 

@@ -5,7 +5,6 @@ use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
 
 use bdk_chain::bitcoin;
-use bdk_chain::BlockId;
 
 use block_graph::{BlockGraph, ChangeSet};
 
@@ -27,8 +26,7 @@ fn from_changeset(c: &mut Criterion) {
     for i in 0..CT {
         let height = i as u32;
         let hash = Hash::hash(height.to_be_bytes().as_slice());
-        let block_id = BlockId { height, hash };
-        changeset.blocks.insert((block_id, hash, parent_hash));
+        changeset.blocks.insert(hash, (height, hash, parent_hash));
         // update next parent id.
         parent_hash = hash;
     }
