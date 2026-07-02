@@ -15,14 +15,13 @@ fn is_block_in_chain(c: &mut Criterion) {
     // Initialize blockgraph
     let mut block_graph = BlockGraph::from_genesis(Hash::hash(b"0"));
     let mut cp = block_graph.tip();
-    let tip_hash = cp.hash();
 
     // Insert block into blockgraph
     for height in 1..=CT as u32 {
         let hash: BlockHash = Hash::hash(height.to_string().as_bytes());
         cp = cp.push(height, hash).unwrap();
     }
-    let _ = block_graph.apply_update(cp, tip_hash).unwrap();
+    let _ = block_graph.apply_update(cp).unwrap();
 
     assert_eq!(block_graph.iter().count(), CT + 1);
 

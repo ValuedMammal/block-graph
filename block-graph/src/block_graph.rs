@@ -12,12 +12,10 @@
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
-use core::fmt::Debug;
+use core::fmt::{self, Debug, Display};
 use core::ops::RangeBounds;
 
-use bdk_chain::{
-    bitcoin, local_chain::MissingGenesisError, BlockId, ChainOracle, Merge, ToBlockHash,
-};
+use bdk_chain::{bitcoin, BlockId, ChainOracle, Merge, ToBlockHash};
 use bitcoin::{hashes::Hash, BlockHash};
 
 use crate::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -28,8 +26,9 @@ use crate::CheckPoint;
 pub struct BlockGraph<T> {
     /// Nodes of `(Height, T)` in the block graph keyed by block hash.
     blocks: HashMap<BlockHash, (u32, T)>,
-    /// Map of block hash to set of parent IDs
-    /// `parents` is a set because a child can point to its own parent and/or a
+    /// Map of block hash to set of parent IDs.
+    ///
+    /// `parents` is a set because a child can point to its own parent and/or
     /// a more distant ancestor.
     parents: HashMap<BlockHash, BTreeSet<BlockId>>,
     /// `next_hashes` maps a block hash to the set of hashes extending from it.
@@ -109,8 +108,8 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
     ///
     /// # Errors
     ///
-    /// Returns [`MissingGenesisError`] if no block at height 0 exists in the changeset.
-    pub fn from_changeset(changeset: ChangeSet<T>) -> Result<Option<Self>, MissingGenesisError> {
+    /// Returns [`FromChangeSetError`] if no block at height 0 exists in the changeset.
+    pub fn from_changeset(changeset: ChangeSet<T>) -> Result<Option<Self>, FromChangeSetError> {
         if changeset.blocks.is_empty() {
             return Ok(None);
         }
@@ -118,7 +117,7 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
             .blocks
             .values()
             .find(|(height, _, _)| *height == 0)
-            .ok_or(MissingGenesisError)?;
+            .ok_or(FromChangeSetError::MissingGenesis)?;
 
         let mut graph = Self::from_genesis(genesis_value.clone());
 
@@ -241,29 +240,24 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
         })
     }
 
-    /// Connects a value of `T` having `block_id` which is connected to `prev_hash`.
+    /// Connects a value of `T` at `height` which is connected to `prev_hash`.
     ///
     /// Note: This method only adds block data to the [`BlockGraph`] without updating the
     /// canonical chain tip. To do that use [`apply_update`](Self::apply_update).
     ///
     /// # Errors
     ///
-    /// - If `value` doesn't produce the same block hash as `block_id.hash`.
-    /// - If the parent having `prev_hash` exists in graph not at a strictly lesser height
-    ///   than `block_id.height`.
+    /// - If the parent with `prev_hash` doesn't exist at a strictly lower height than
+    ///   the `height` being connected.
     pub fn connect_block(
         &mut self,
-        block_id: BlockId,
+        height: u32,
         value: T,
         prev_hash: BlockHash,
-    ) -> Result<ChangeSet<T>, &'static str> {
-        let mut changeset = ChangeSet::default();
-        let height = block_id.height;
-        let hash = block_id.hash;
-        if value.to_blockhash() != hash {
-            return Err("block hash mismatch");
-        }
-        // The same value exists in self.blocks
+    ) -> Result<ChangeSet<T>, ConnectBlockError> {
+        let hash = value.to_blockhash();
+
+        // Already recorded with the same height and parent.
         if self
             .blocks
             .get(&hash)
@@ -273,33 +267,45 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
             // The same parent-child dependency exists
             && self.next_hashes.get(&prev_hash).is_some_and(|set| set.contains(&hash))
         {
-            return Ok(changeset);
+            return Ok(ChangeSet::default());
         }
+
+        // If a parent exists in graph it must have a smaller height
+        let parent_opt = self.block_id(&prev_hash);
+        if let Some(parent_id) = parent_opt {
+            if parent_id.height >= height {
+                return Err(ConnectBlockError::ParentHeightNotSmaller);
+            }
+        }
+
+        let mut changeset = ChangeSet::default();
+
         // Add block to graph
         self.blocks.insert(hash, (height, value.clone()));
         // Record that this block extends from its parent
         self.next_hashes.entry(prev_hash).or_default().insert(hash);
         // Record prev as a parent of this block
-        if let Some(parent_id) = self.block_id(&prev_hash) {
-            if parent_id.height >= height {
-                return Err("value must connect to parent of smaller height");
-            }
+        if let Some(parent_id) = parent_opt {
             self.parents.entry(hash).or_default().insert(parent_id);
         }
+
         changeset.blocks.insert(hash, (height, value, prev_hash));
 
         Ok(changeset)
     }
 
-    /// Applies a checkpoint update.
+    /// Applies a [`CheckPoint`] update to the [`BlockGraph`] and returns the resulting [`ChangeSet`].
     ///
-    /// - `prev_hash`: Indicates the hash of a parent block to which the root of the
-    ///   checkpoint should connect.
+    /// If the update results in a new best tip, or if a fork is detected, the BlockGraph reconciles
+    /// the single canonical chain tip internally.
+    ///
+    /// Errors if a checkpoint item doesn't declare its parent, indicating no common ancestor
+    /// was found between `checkpoint` and this `BlockGraph`.
+    /// Or if `connect_block` returns an error due to an invalid parent-child dependency.
     pub fn apply_update(
         &mut self,
         checkpoint: CheckPoint<T>,
-        prev_hash: BlockHash,
-    ) -> Result<ChangeSet<T>, &'static str>
+    ) -> Result<ChangeSet<T>, ApplyUpdateError>
     where
         T: ToBlockHash + Clone,
     {
@@ -307,10 +313,11 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
         let mut items = self.merge_chains(checkpoint);
         items.reverse();
         let from_hash = items.first().map(|(id, _, _)| id.hash);
-        // Connect each item in ascending height order. `prev` should only be None for
-        // the first element, ie. the root of the checkpoint.
-        for (height, value, prev) in items {
-            changeset.merge(self.connect_block(height, value, prev.unwrap_or(prev_hash))?);
+        // Connect each item in ascending height order. At this point all parent
+        // hashes must be known, otherwise we don't know where the update connects.
+        for (block_id, value, prev) in items {
+            let prev_hash = prev.ok_or(ApplyUpdateError::MissingParent)?;
+            changeset.merge(self.connect_block(block_id.height, value, prev_hash)?);
         }
         // To update the canonical chain we need to re-canonicalize the graph
         // starting from the most recent common ancestor (i.e. "fork point").
@@ -481,6 +488,73 @@ where
     }
 }
 
+/// Error returned by [`BlockGraph::from_changeset`].
+#[derive(Debug, PartialEq)]
+pub enum FromChangeSetError {
+    /// The changeset contains no block at height 0.
+    MissingGenesis,
+}
+
+impl Display for FromChangeSetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingGenesis => write!(f, "changeset contains no genesis block (height 0)"),
+        }
+    }
+}
+
+impl core::error::Error for FromChangeSetError {}
+
+/// Error returned by [`BlockGraph::connect_block`].
+#[derive(Debug, PartialEq)]
+pub enum ConnectBlockError {
+    /// The declared parent's height is not strictly less than the new block's height.
+    ParentHeightNotSmaller,
+}
+
+impl Display for ConnectBlockError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ParentHeightNotSmaller => write!(
+                f,
+                "parent block height must be strictly less than the new block's height",
+            ),
+        }
+    }
+}
+
+impl core::error::Error for ConnectBlockError {}
+
+/// Error returned by [`BlockGraph::apply_update`].
+#[derive(Debug, PartialEq)]
+pub enum ApplyUpdateError {
+    /// A block in the update has no declared parent hash, so its connection
+    /// point in the graph cannot be determined.
+    MissingParent,
+    /// A block could not be connected due to an invalid parent-child height relationship.
+    ConnectBlock(ConnectBlockError),
+}
+
+impl Display for ApplyUpdateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingParent => write!(
+                f,
+                "a block in the update has no declared parent; cannot determine connection point",
+            ),
+            Self::ConnectBlock(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl core::error::Error for ApplyUpdateError {}
+
+impl From<ConnectBlockError> for ApplyUpdateError {
+    fn from(e: ConnectBlockError) -> Self {
+        Self::ConnectBlock(e)
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::string::ToString;
@@ -524,7 +598,7 @@ mod test {
             cp = cp.push(height, hash).unwrap();
         }
 
-        let changeset = graph.apply_update(cp, genesis_block.hash).unwrap();
+        let changeset = graph.apply_update(cp).unwrap();
 
         // Verify the changeset contains the expected blocks
         assert_eq!(changeset.blocks.len(), 3);
@@ -557,7 +631,7 @@ mod test {
             cp = cp.push(height, hash).unwrap();
             blocks.push(BlockId { height, hash });
         }
-        let _ = graph.apply_update(cp, genesis_block.hash).unwrap();
+        let _ = graph.apply_update(cp).unwrap();
 
         blocks.reverse();
         let tip_blocks = graph.iter().map(|cp| cp.block_id()).collect::<Vec<_>>();
@@ -578,7 +652,7 @@ mod test {
             cp = cp.push(height, hash).unwrap();
         }
 
-        let _ = graph.apply_update(cp, genesis_block.hash).unwrap();
+        let _ = graph.apply_update(cp).unwrap();
 
         // Collect the initial changeset
         let init_cs = graph.initial_changeset();
@@ -603,7 +677,7 @@ mod test {
             hash: Hash::hash(b"1"),
         };
         tip = tip.push(1, block_1.hash).unwrap();
-        let changeset = graph.apply_update(tip, genesis_block.hash).unwrap();
+        let changeset = graph.apply_update(tip).unwrap();
 
         assert_eq!(changeset.blocks.len(), 1);
         assert_eq!(
@@ -630,7 +704,7 @@ mod test {
             hash: Hash::hash(b"two"),
         };
         tip = tip.extend([(1, block_1.hash), (2, block_2.hash)]).unwrap();
-        let changeset = graph.apply_update(tip, genesis_block.hash).unwrap();
+        let changeset = graph.apply_update(tip).unwrap();
 
         assert_eq!(changeset.blocks.len(), 2);
         assert_eq!(
@@ -719,7 +793,7 @@ mod test {
             let hash = Hash::hash(height.to_string().as_bytes());
             cp = cp.insert(height, hash);
         }
-        let _ = graph.apply_update(cp.clone(), genesis_hash).unwrap();
+        let _ = graph.apply_update(cp.clone()).unwrap();
 
         // Now insert block 1
         let hash_1 = Hash::hash(b"1");
@@ -729,7 +803,7 @@ mod test {
         };
         cp = cp.insert(1, hash_1);
         let block_2 = cp.get(2).map(|cp| cp.block_id()).expect("block_2 should exist in CP");
-        let changeset = graph.apply_update(cp, genesis_hash).unwrap();
+        let changeset = graph.apply_update(cp).unwrap();
 
         // Verify changeset contains the expected block
         assert_eq!(
@@ -764,9 +838,9 @@ mod test {
         let mut graph = BlockGraph::from_genesis(genesis_hash);
 
         let block_1_hash = Hash::hash(b"1");
-        let cp = CheckPoint::new(1, block_1_hash);
+        let cp = graph.tip().push(1, block_1_hash).unwrap();
 
-        let changeset = graph.apply_update(cp, genesis_hash).unwrap();
+        let changeset = graph.apply_update(cp).unwrap();
 
         assert_eq!(graph.tip().height(), 1);
         assert_eq!(graph.tip().hash(), block_1_hash);
@@ -788,11 +862,11 @@ mod test {
         let hash_1 = Hash::hash(b"1");
         let hash_2 = Hash::hash(b"2");
         let hash_3 = Hash::hash(b"3");
-        let mut cp = CheckPoint::new(1, hash_1);
+        let mut cp = graph.tip().push(1, hash_1).unwrap();
         cp = cp.push(2, hash_2).unwrap();
         cp = cp.push(3, hash_3).unwrap();
 
-        let changeset = graph.apply_update(cp, genesis_hash).unwrap();
+        let changeset = graph.apply_update(cp).unwrap();
 
         assert_eq!(graph.tip().height(), 3);
         assert_eq!(graph.blocks.len(), 4);
@@ -809,15 +883,15 @@ mod test {
 
     #[test]
     fn test_apply_update_maintains_chain_integrity() {
-        let genesis_hash = Hash::hash(b"0");
+        let genesis_hash: BlockHash = Hash::hash(b"0");
         let mut graph = BlockGraph::from_genesis(genesis_hash);
 
         let hash_1 = Hash::hash(b"1");
         let hash_2 = Hash::hash(b"2");
-        let mut cp = CheckPoint::new(1, hash_1);
+        let mut cp = graph.tip().push(1, hash_1).unwrap();
         cp = cp.push(2, hash_2).unwrap();
 
-        graph.apply_update(cp, genesis_hash).unwrap();
+        graph.apply_update(cp).unwrap();
 
         // Verify parent-child relationships
         assert!(graph.next_hashes.get(&genesis_hash).unwrap().contains(&hash_1));
@@ -830,9 +904,9 @@ mod test {
         let mut graph = BlockGraph::from_genesis(genesis_hash);
 
         let hash_1 = Hash::hash(b"1");
-        let cp = CheckPoint::new(1, hash_1);
+        let cp = graph.tip().push(1, hash_1).unwrap();
 
-        graph.apply_update(cp, genesis_hash).unwrap();
+        graph.apply_update(cp).unwrap();
 
         let tip_id = graph.tip().block_id();
         assert_eq!(tip_id.height, 1);
@@ -848,17 +922,16 @@ mod test {
         let hash_2 = Hash::hash(b"2");
 
         // First update
-        let mut cp1 = CheckPoint::new(1, hash_1);
+        let mut cp1 = graph.tip().push(1, hash_1).unwrap();
         cp1 = cp1.push(2, hash_2).unwrap();
-        let changeset1 = graph.apply_update(cp1, genesis_hash).unwrap();
+        let changeset1 = graph.apply_update(cp1).unwrap();
 
         assert_eq!(changeset1.blocks.len(), 2);
 
         // Second update extending from previous tip
-        let prev_tip_hash = graph.tip().hash();
         let hash_3 = Hash::hash(b"3");
-        let cp2 = CheckPoint::new(3, hash_3);
-        let changeset2 = graph.apply_update(cp2, prev_tip_hash).unwrap();
+        let cp2 = graph.tip().push(3, hash_3).unwrap();
+        let changeset2 = graph.apply_update(cp2).unwrap();
 
         assert_eq!(graph.tip().height(), 3);
         assert_eq!(graph.blocks.len(), 4);
@@ -877,7 +950,7 @@ mod test {
         let hash_2 = Hash::hash(b"2");
 
         // Connect block 1
-        let cs = graph.connect_block((1, hash_1).into(), hash_1, genesis_hash).unwrap();
+        let cs = graph.connect_block(1, hash_1, genesis_hash).unwrap();
         assert_eq!(cs.blocks, [(hash_1, (1u32, hash_1, genesis_hash))].into());
         assert!(
             graph
@@ -897,7 +970,7 @@ mod test {
         );
 
         // Connect block 2
-        let cs = graph.connect_block((2, hash_2).into(), hash_2, hash_1).unwrap();
+        let cs = graph.connect_block(2, hash_2, hash_1).unwrap();
         assert_eq!(cs.blocks, [(hash_2, (2u32, hash_2, hash_1))].into());
         assert!(
             graph
@@ -928,11 +1001,13 @@ mod test {
         let hash_1b = Hash::hash(b"1b");
 
         let _ = graph
-            .apply_update(checkpoint([(1, hash_1a), (2, hash_2a)]), genesis_hash)
+            .apply_update(checkpoint([(0, genesis_hash), (1, hash_1a), (2, hash_2a)]))
             .unwrap();
 
         // Add shorter competing chain
-        let _ = graph.apply_update(checkpoint([(1, hash_1b)]), genesis_hash).unwrap();
+        let _ = graph
+            .apply_update(checkpoint([(0, genesis_hash), (1, hash_1b)]))
+            .unwrap();
 
         // Longer chain should be canonical
         assert_eq!(graph.tip().block_id(), (2, hash_2a).into());
@@ -944,9 +1019,9 @@ mod test {
         let mut graph = BlockGraph::from_genesis(genesis_hash);
 
         let hash_3 = Hash::hash(b"3");
-        let cp = CheckPoint::new(3, hash_3);
+        let cp = graph.tip().insert(3, hash_3);
 
-        let changeset = graph.apply_update(cp, genesis_hash).unwrap();
+        let changeset = graph.apply_update(cp).unwrap();
 
         // Should create a single block at height 3 connecting to genesis
         assert_eq!(changeset.blocks.len(), 1);
@@ -959,16 +1034,12 @@ mod test {
         let mut graph = BlockGraph::from_genesis(genesis_hash);
 
         let block_1_hash = Hash::hash(b"1");
-        graph
-            .connect_block((1, block_1_hash).into(), block_1_hash, genesis_hash)
-            .unwrap();
+        graph.connect_block(1, block_1_hash, genesis_hash).unwrap();
 
         assert_eq!(graph.blocks.len(), 2);
 
         // Connecting same block again should be ok
-        let cs = graph
-            .connect_block((1, block_1_hash).into(), block_1_hash, genesis_hash)
-            .unwrap();
+        let cs = graph.connect_block(1, block_1_hash, genesis_hash).unwrap();
         assert!(
             cs.is_empty(),
             "Same block connection should return an empty change set"
@@ -981,7 +1052,7 @@ mod test {
         let mut graph = BlockGraph::from_genesis(genesis_hash);
 
         let hash_1 = Hash::hash(b"1");
-        graph.connect_block((1, hash_1).into(), hash_1, genesis_hash).unwrap();
+        graph.connect_block(1, hash_1, genesis_hash).unwrap();
 
         let block_id = graph.block_id(&hash_1).unwrap();
         assert_eq!(block_id.height, 1);
@@ -1007,7 +1078,7 @@ mod test {
 
     #[test]
     fn test_range_blocks() {
-        let genesis_hash = Hash::hash(b"0");
+        let genesis_hash: BlockHash = Hash::hash(b"0");
         let mut graph = BlockGraph::from_genesis(genesis_hash);
 
         let mut cp = graph.tip();
@@ -1017,7 +1088,7 @@ mod test {
             cp = cp.push(i, hash).unwrap();
         }
 
-        let _ = graph.apply_update(cp, genesis_hash);
+        let _ = graph.apply_update(cp);
 
         let range_items: BTreeSet<u32> = graph.range(2..=4).map(|cp| cp.height()).collect();
         assert_eq!(range_items, [2, 3, 4].into());
@@ -1044,7 +1115,7 @@ mod test {
         let mut graph = BlockGraph::from_changeset(changeset).unwrap().unwrap();
 
         // connect 3-alternate
-        let _ = graph.apply_update(checkpoint([(3, hash_3_alt)]), hash_2).unwrap();
+        let _ = graph.apply_update(checkpoint([(2, hash_2), (3, hash_3_alt)])).unwrap();
         // Chain tip should change if hash_3_alt is smaller
         if hash_3_alt < hash_3 {
             assert_eq!(graph.tip.hash(), hash_3_alt);
@@ -1053,7 +1124,9 @@ mod test {
         }
 
         // Now extend competing branch, we should correctly switch forks
-        let _ = graph.apply_update(checkpoint([(4, hash_4_alt)]), hash_3_alt).unwrap();
+        let _ = graph
+            .apply_update(checkpoint([(2, hash_2), (3, hash_3_alt), (4, hash_4_alt)]))
+            .unwrap();
         assert_eq!(graph.tip.hash(), hash_4_alt);
     }
 
@@ -1070,7 +1143,7 @@ mod test {
             let hash = Hash::hash(height.to_string().as_bytes());
             cp = cp.push(height, hash).unwrap();
         }
-        let _ = graph.apply_update(cp, genesis_hash).unwrap();
+        let _ = graph.apply_update(cp).unwrap();
 
         assert_eq!(graph.tip().height(), INIT_HEIGHT);
         assert_eq!(graph.blocks.len() as u32, COUNT);
@@ -1091,7 +1164,7 @@ mod test {
         // Apply the update - this should only connect 1 new block due to eq_ptr optimization
         let items_to_connect = graph.merge_chains(update_checkpoint.clone());
         assert_eq!(items_to_connect.len(), 1);
-        let changeset = graph.apply_update(update_checkpoint, original_tip_hash).unwrap();
+        let changeset = graph.apply_update(update_checkpoint).unwrap();
 
         // Verify that only 1 new block was processed in the changeset
         assert_eq!(
@@ -1140,5 +1213,19 @@ mod test {
                 "Heights should be in descending order"
             );
         }
+    }
+
+    #[test]
+    fn test_apply_update_missing_parent_error() {
+        // A checkpoint whose tail block has no common ancestor with the graph
+        // should return ApplyUpdateError::MissingParent.
+        let genesis_hash: BlockHash = Hash::hash(b"0");
+        let mut graph = BlockGraph::from_genesis(genesis_hash);
+
+        // Single-block checkpoint with no chain back to genesis
+        let orphan_hash = Hash::hash(b"orphan");
+        let cp = CheckPoint::new(1, orphan_hash);
+
+        assert_eq!(graph.apply_update(cp), Err(ApplyUpdateError::MissingParent));
     }
 }

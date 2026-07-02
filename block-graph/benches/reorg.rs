@@ -27,7 +27,6 @@ fn header(prev_blockhash: BlockHash, nonce: Option<u32>) -> Header {
 
 fn one_hundred_block_reorg(c: &mut Criterion) {
     // Create a BlockGraph with 101 elements (tip height of 100)
-    let genesis_hash: BlockHash = Hash::hash(b"0");
     let genesis_header = header(BlockHash::all_zeros(), None);
     let mut block_graph = BlockGraph::from_genesis(genesis_header);
     let genesis_cp = block_graph.tip();
@@ -39,7 +38,7 @@ fn one_hundred_block_reorg(c: &mut Criterion) {
         let header = header(prev_blockhash, None);
         cp = cp.push(height, header).unwrap();
     }
-    let _ = block_graph.apply_update(cp, genesis_hash).unwrap();
+    let _ = block_graph.apply_update(cp).unwrap();
     assert_eq!(block_graph.iter().count(), 101);
 
     // Create other checkpoint chain with blocks 1'-101'
@@ -55,9 +54,7 @@ fn one_hundred_block_reorg(c: &mut Criterion) {
         // Apply the checkpoint update and verify reorg occurred
         b.iter(|| {
             let mut test_block_graph = block_graph.clone();
-            let _ = test_block_graph
-                .apply_update(black_box(other_cp.clone()), black_box(genesis_hash))
-                .unwrap();
+            let _ = test_block_graph.apply_update(black_box(other_cp.clone())).unwrap();
             let new_tip = test_block_graph.tip();
             assert_eq!(new_tip.block_id(), (101, expected_tip_hash).into());
         });

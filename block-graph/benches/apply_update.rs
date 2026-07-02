@@ -9,7 +9,6 @@ use bdk_chain::bitcoin;
 const CT: u32 = 1000;
 
 type BlockGraph = block_graph::BlockGraph<BlockHash>;
-type CheckPoint = block_graph::CheckPoint<BlockHash>;
 
 fn bench_apply_update(c: &mut Criterion) {
     let mut changeset = block_graph::ChangeSet::default();
@@ -28,14 +27,13 @@ fn bench_apply_update(c: &mut Criterion) {
 
     // Connect next block to tip
     let tip = graph.tip();
-    let tip_hash = tip.hash();
-    let update = CheckPoint::new(CT + 1, Hash::hash(b"update"));
+    let update = tip.push(CT + 1, Hash::hash(b"update")).unwrap();
 
     c.bench_function("apply_update", move |b| {
         b.iter(|| {
             let mut graph = graph.clone();
             graph
-                .apply_update(black_box(update.clone()), black_box(tip_hash))
+                .apply_update(black_box(update.clone()))
                 .expect("failed to apply update");
             let tip = graph.tip();
             assert_eq!(tip.height(), CT + 1);
