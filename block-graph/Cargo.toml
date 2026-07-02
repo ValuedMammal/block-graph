@@ -35,4 +35,4 @@ serde = ["dep:serde", "bdk_chain/serde"]
 path = "."
 
 [dev-dependencies]
-criterion = "0.2"
+criterion = "0.7"

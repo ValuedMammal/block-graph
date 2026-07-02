@@ -1,10 +1,10 @@
-use criterion::Criterion;
-use criterion::{black_box, criterion_group, criterion_main};
-
-use bitcoin::hashes::Hash;
-use bitcoin::BlockHash;
+use std::hint::black_box;
 
 use bdk_chain::bitcoin;
+use bitcoin::hashes::Hash;
+use bitcoin::BlockHash;
+use criterion::Criterion;
+use criterion::{criterion_group, criterion_main};
 
 const CT: u32 = 1000;
 

@@ -2,15 +2,15 @@
 //! then creates an alternate chain with tip height 101 and connected to genesis.
 //! We bench performance of connecting the new blocks, best tip selection, and setting the new tip.
 
-use criterion::Criterion;
-use criterion::{black_box, criterion_group, criterion_main};
+use std::hint::black_box;
 
+use bdk_chain::bitcoin;
 use bitcoin::block::Header;
 use bitcoin::hashes::Hash;
 use bitcoin::pow;
 use bitcoin::{BlockHash, TxMerkleNode};
-
-use bdk_chain::bitcoin;
+use criterion::Criterion;
+use criterion::{criterion_group, criterion_main};
 
 type BlockGraph = block_graph::BlockGraph<Header>;
 

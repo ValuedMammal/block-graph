@@ -1,12 +1,11 @@
-use criterion::Criterion;
-use criterion::{black_box, criterion_group, criterion_main};
-
-use bitcoin::hashes::Hash;
-use bitcoin::BlockHash;
+use std::hint::black_box;
 
 use bdk_chain::bitcoin;
-
+use bitcoin::hashes::Hash;
+use bitcoin::BlockHash;
 use block_graph::{BlockGraph, ChangeSet};
+use criterion::Criterion;
+use criterion::{criterion_group, criterion_main};
 
 const CT: usize = 10_000;
 
