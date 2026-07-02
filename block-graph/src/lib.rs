@@ -12,9 +12,21 @@ extern crate alloc;
 extern crate std;
 
 mod block_graph;
-mod checkpoint;
 pub use block_graph::*;
-pub use checkpoint::*;
+
+/// Additional methods on `CheckPoint`
+pub(crate) trait CheckPointExt {
+    type Value;
+    /// Obtain the inner value of this `CheckPoint`
+    fn value(&self) -> Self::Value;
+}
+
+impl<T: Clone> CheckPointExt for bdk_chain::CheckPoint<T> {
+    type Value = T;
+    fn value(&self) -> T {
+        self.data()
+    }
+}
 
 #[cfg(feature = "std")]
 pub(crate) mod collections {

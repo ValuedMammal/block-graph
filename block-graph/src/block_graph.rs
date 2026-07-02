@@ -15,11 +15,11 @@ use core::cmp::Ordering;
 use core::fmt::{self, Debug, Display};
 use core::ops::RangeBounds;
 
-use bdk_chain::{bitcoin, BlockId, ChainOracle, Merge, ToBlockHash};
+use bdk_chain::{bitcoin, BlockId, ChainOracle, CheckPoint, Merge, ToBlockHash};
 use bitcoin::{hashes::Hash, BlockHash};
 
 use crate::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use crate::CheckPoint;
+use crate::CheckPointExt;
 
 /// Block graph.
 #[derive(Debug, Clone)]
@@ -564,11 +564,11 @@ mod test {
     use bitcoin::hashes::Hash;
     use bitcoin::{constants, Network};
 
-    fn checkpoint<T>(entries: impl IntoIterator<Item = (u32, T)>) -> CheckPoint<T>
+    fn checkpoint<T>(blocks: impl IntoIterator<Item = (u32, T)>) -> CheckPoint<T>
     where
-        T: core::fmt::Debug + ToBlockHash,
+        T: ToBlockHash + Clone + Debug,
     {
-        CheckPoint::from_entries(entries).expect("failed to create CheckPoint")
+        CheckPoint::from_blocks(blocks).expect("failed to create CheckPoint")
     }
 
     #[test]
