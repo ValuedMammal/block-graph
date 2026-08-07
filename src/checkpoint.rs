@@ -546,3 +546,256 @@ fn get_skip_index(index: u32) -> u32 {
         invert_lowest_one(invert_lowest_one(index - 1)) + 1
     }
 }
+
+#[cfg(test)]
+mod test {
+    use bitcoin::block::Header;
+    use bitcoin::hashes::Hash;
+    use bitcoin::{pow, TxMerkleNode};
+
+    use super::*;
+    use crate::collections::BTreeMap;
+
+    /// Build a header extending `prev_blockhash`. `nonce` acts as a fork discriminator: headers
+    /// with the same `prev_blockhash` but different `nonce` produce distinct hashes.
+    fn header(prev_blockhash: BlockHash, nonce: Option<u32>) -> Header {
+        Header {
+            version: bitcoin::block::Version::default(),
+            merkle_root: TxMerkleNode::all_zeros(),
+            time: 1234567,
+            bits: pow::Target::MAX_ATTAINABLE_REGTEST.to_compact_lossy(),
+            nonce: nonce.unwrap_or_default(),
+            prev_blockhash,
+        }
+    }
+
+    fn genesis() -> Header {
+        header(BlockHash::all_zeros(), Some(0))
+    }
+
+    /// Build a dense chain of `count` blocks (heights `0..count`) linked by `BlockHash`.
+    fn dense_chain(count: u32) -> CheckPoint<BlockHash> {
+        let mut cp = CheckPoint::new(0, Hash::hash(b"genesis"));
+        for height in 1..count {
+            let hash = Hash::hash(height.to_be_bytes().as_slice());
+            cp = cp.push(height, hash).unwrap();
+        }
+        cp
+    }
+
+    // --- Invariants: `push_connected` / `extend_connected` / `ConnectError` ---
+
+    #[test]
+    fn push_connected_rejects_non_increasing_height() {
+        let cp = CheckPoint::new(5, genesis());
+        let h = header(genesis().block_hash(), Some(1));
+
+        let err = cp.clone().push_connected(5, h).unwrap_err();
+        assert_eq!(err.checkpoint.height(), 5, "tip is returned unchanged on error");
+        assert_eq!(err.value, h);
+
+        let err = cp.push_connected(4, h).unwrap_err();
+        assert_eq!(err.value, h);
+    }
+
+    #[test]
+    fn push_connected_rejects_adjacent_prev_blockhash_mismatch() {
+        let gen = genesis();
+        let cp = CheckPoint::new(0, gen);
+        // `h`'s prev_blockhash doesn't match `gen`'s hash.
+        let h = header(BlockHash::all_zeros(), Some(1));
+
+        let err = cp.clone().push_connected(1, h).unwrap_err();
+        assert_eq!(err.checkpoint.hash(), gen.block_hash());
+        assert_eq!(err.value, h);
+    }
+
+    #[test]
+    fn push_connected_accepts_adjacent_match() {
+        let gen = genesis();
+        let h = header(gen.block_hash(), Some(1));
+
+        let cp = CheckPoint::new(0, gen).push_connected(1, h).unwrap();
+        assert_eq!(cp.hash(), h.block_hash());
+    }
+
+    #[test]
+    fn push_connected_skips_check_on_gap() {
+        let gen = genesis();
+        // `h`'s prev_blockhash doesn't match `gen`, but height 2 is a gapped push
+        // (height 1 is absent), so the linkage check doesn't apply.
+        let h = header(BlockHash::all_zeros(), Some(2));
+
+        let cp = CheckPoint::new(0, gen).push_connected(2, h).unwrap();
+        assert_eq!(cp.hash(), h.block_hash());
+    }
+
+    #[test]
+    fn extend_connected_stops_at_first_broken_link() {
+        let gen = genesis();
+        let h1 = header(gen.block_hash(), Some(1));
+        let broken_h2 = header(BlockHash::all_zeros(), Some(2)); // doesn't extend h1
+
+        let err = CheckPoint::new(0, gen)
+            .extend_connected([(1, h1), (2, broken_h2)])
+            .unwrap_err();
+        assert_eq!(err.checkpoint.height(), 1, "should retain the successfully pushed h1");
+        assert_eq!(err.checkpoint.hash(), h1.block_hash());
+        assert_eq!(err.value, broken_h2);
+    }
+
+    // --- Invariants: `insert_connected` ---
+
+    #[test]
+    fn insert_connected_noop_on_identical_value() {
+        let gen = genesis();
+        let h1 = header(gen.block_hash(), Some(1));
+        let cp = CheckPoint::new(0, gen).push_connected(1, h1).unwrap();
+
+        let same = cp.clone().insert_connected(1, h1);
+        assert!(same.eq_ptr(&cp), "identical insert must return the chain unchanged");
+    }
+
+    #[test]
+    fn insert_connected_evicts_above_on_hash_conflict_at_height() {
+        let gen = genesis();
+        let h1 = header(gen.block_hash(), Some(1));
+        let h2 = header(h1.block_hash(), Some(2));
+        let cp = CheckPoint::new(0, gen)
+            .push_connected(1, h1)
+            .unwrap()
+            .push_connected(2, h2)
+            .unwrap();
+
+        // A conflicting header at height 1 evicts both h1 and h2 (which sits above it).
+        let h1_conflict = header(gen.block_hash(), Some(101));
+        let cp = cp.insert_connected(1, h1_conflict);
+        assert_eq!(cp.height(), 1);
+        assert_eq!(cp.hash(), h1_conflict.block_hash());
+    }
+
+    #[test]
+    fn insert_connected_displaces_adjacent_below_on_prev_blockhash_conflict() {
+        let gen = genesis();
+        let h1 = header(gen.block_hash(), Some(1));
+        // h3 is gapped (height 2 absent), so its prev_blockhash was never validated.
+        let h3 = header(BlockHash::all_zeros(), Some(3));
+        let cp = CheckPoint::new(0, gen).push_connected(1, h1).unwrap().insert(3, h3);
+
+        // h2's prev_blockhash doesn't match h1's hash: h1 is displaced (along with h3,
+        // which sits above it), rather than becoming h2's validated parent.
+        let h2 = header(BlockHash::all_zeros(), Some(2));
+        let cp = cp.insert_connected(2, h2);
+        assert_eq!(cp.height(), 2);
+        assert_eq!(cp.hash(), h2.block_hash());
+        assert!(cp.get(1).is_none(), "h1 should have been displaced");
+    }
+
+    #[test]
+    fn insert_connected_truncates_tail_that_no_longer_connects() {
+        let gen = genesis();
+        // h3 is gapped (height 2 absent), so its prev_blockhash was never validated
+        // against a real predecessor.
+        let h3 = header(BlockHash::all_zeros(), Some(3));
+        let cp = CheckPoint::new(0, gen).insert(3, h3);
+
+        // Filling the gap at height 2 makes h3 adjacent to h2; since h3's prev_blockhash
+        // doesn't actually point to h2, the rebuild truncates the chain at h2.
+        let h2 = header(gen.block_hash(), Some(2));
+        let cp = cp.insert_connected(2, h2);
+        assert_eq!(cp.height(), 2, "h3 must be dropped since it no longer connects");
+        assert_eq!(cp.hash(), h2.block_hash());
+    }
+
+    #[test]
+    #[should_panic(expected = "inserted data implies a different genesis")]
+    fn insert_connected_panics_on_genesis_mismatch() {
+        let cp = CheckPoint::new(0, genesis());
+        let other_genesis = header(BlockHash::all_zeros(), Some(999));
+        let _ = cp.insert_connected(0, other_genesis);
+    }
+
+    // --- Skip-pointer machinery ---
+
+    #[test]
+    fn get_matches_linear_scan() {
+        const COUNT: u32 = 500;
+        let cp = dense_chain(COUNT);
+
+        let expected: BTreeMap<u32, BlockHash> =
+            cp.iter().map(|c| (c.height(), c.hash())).collect();
+        for height in 0..COUNT {
+            assert_eq!(
+                cp.get(height).map(|c| c.hash()),
+                expected.get(&height).copied(),
+                "mismatch at height {height}"
+            );
+        }
+        assert!(cp.get(COUNT).is_none(), "height past tip must be None");
+    }
+
+    #[test]
+    fn checkpoint_at_index_matches_naive_traversal() {
+        const COUNT: u32 = 500;
+        let cp = dense_chain(COUNT);
+
+        let expected: BTreeMap<u32, BlockId> =
+            cp.iter().map(|c| (c.index(), c.block_id())).collect();
+        for (&index, &block_id) in &expected {
+            assert_eq!(
+                cp.checkpoint_at_index(index).map(|c| c.block_id()),
+                Some(block_id),
+                "mismatch at index {index}"
+            );
+        }
+        assert!(cp.checkpoint_at_index(cp.index() + 1).is_none());
+    }
+
+    #[test]
+    fn walk_to_floor_matches_naive_traversal() {
+        // Build a chain with gaps so some target heights aren't directly present.
+        let gen: BlockHash = Hash::hash(b"genesis");
+        let heights: [u32; 6] = [0, 3, 4, 8, 15, 16];
+        let mut cp = CheckPoint::new(0, gen);
+        for &height in &heights[1..] {
+            let hash = Hash::hash(height.to_be_bytes().as_slice());
+            cp = cp.insert(height, hash);
+        }
+
+        for target in 0..=20u32 {
+            let expected = cp.iter().find(|c| c.height() <= target).map(|c| c.block_id());
+            assert_eq!(
+                cp.walk_to_floor(target).map(|c| c.block_id()),
+                expected,
+                "mismatch for target height {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn range_matches_linear_filter() {
+        // A gapped chain stresses the bound-seeking logic in `range` beyond a dense chain.
+        let gen: BlockHash = Hash::hash(b"genesis");
+        let heights: [u32; 5] = [0, 2, 5, 6, 10];
+        let mut cp = CheckPoint::new(0, gen);
+        for &height in &heights[1..] {
+            let hash = Hash::hash(height.to_be_bytes().as_slice());
+            cp = cp.insert(height, hash);
+        }
+        let all: Vec<u32> = cp.iter().map(|c| c.height()).collect();
+
+        let got: Vec<u32> = cp.range(0..11).map(|c| c.height()).collect();
+        assert_eq!(got, all);
+
+        let got: Vec<u32> = cp.range(3..7).map(|c| c.height()).collect();
+        let expected: Vec<u32> = all.iter().copied().filter(|h| (3..7).contains(h)).collect();
+        assert_eq!(got, expected);
+
+        let got: Vec<u32> = cp.range(6..=10).map(|c| c.height()).collect();
+        let expected: Vec<u32> = all.iter().copied().filter(|h| *h >= 6).collect();
+        assert_eq!(got, expected);
+
+        let got: Vec<u32> = cp.range(100..200).map(|c| c.height()).collect();
+        assert!(got.is_empty());
+    }
+}

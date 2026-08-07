@@ -27,7 +27,7 @@ test-name name="":
 
 # Run block-graph unit tests
 test:
-    cargo test -p block_graph --no-fail-fast --all-features --lib -- block_graph::test
+    cargo test -p block_graph --no-fail-fast --all-features --lib --
 
 # Run block-graph benchmarks
 bench:

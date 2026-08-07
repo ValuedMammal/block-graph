@@ -1,15 +1,28 @@
 use std::hint::black_box;
 
+use bitcoin::block::Header;
 use bitcoin::hashes::Hash;
-use bitcoin::BlockHash;
+use bitcoin::pow;
+use bitcoin::{BlockHash, TxMerkleNode};
 use block_graph::{BlockGraph, ChangeSet};
 use criterion::Criterion;
 use criterion::{criterion_group, criterion_main};
 
 const CT: usize = 10_000;
 
+fn header(prev_blockhash: BlockHash, nonce: Option<u32>) -> Header {
+    Header {
+        version: bitcoin::block::Version::default(),
+        merkle_root: TxMerkleNode::all_zeros(),
+        time: 1234567,
+        bits: pow::Target::MAX_ATTAINABLE_REGTEST.to_compact_lossy(),
+        nonce: nonce.unwrap_or_default(),
+        prev_blockhash,
+    }
+}
+
 // Construct `BlockGraph` from the given changeset.
-fn bench_from_changeset(changeset: ChangeSet<BlockHash>) {
+fn bench_from_changeset(changeset: ChangeSet<Header>) {
     let graph = BlockGraph::from_changeset(changeset)
         .expect("must contain genesis")
         .expect("failed to construct BlockGraph from changeset");
@@ -23,11 +36,11 @@ fn from_changeset(c: &mut Criterion) {
 
     for i in 0..CT {
         let height = i as u32;
-        let hash = Hash::hash(height.to_be_bytes().as_slice());
-        changeset.blocks.insert(hash, (height, hash));
-        changeset.edges.insert((parent_hash, hash));
+        let h = header(parent_hash, Some(height));
+        changeset.blocks.insert(h.block_hash(), (height, h));
+        changeset.edges.insert((parent_hash, h.block_hash()));
         // update next parent id.
-        parent_hash = hash;
+        parent_hash = h.block_hash();
     }
 
     c.bench_function("from_changeset", move |b| {

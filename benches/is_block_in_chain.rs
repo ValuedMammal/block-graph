@@ -1,7 +1,9 @@
 use std::hint::black_box;
 
+use bitcoin::block::Header;
 use bitcoin::hashes::Hash;
-use bitcoin::BlockHash;
+use bitcoin::pow;
+use bitcoin::{BlockHash, TxMerkleNode};
 use criterion::Criterion;
 use criterion::{criterion_group, criterion_main};
 
@@ -9,17 +11,29 @@ use block_graph::BlockId;
 
 const CT: usize = 50_000;
 
-type BlockGraph = block_graph::BlockGraph<BlockHash>;
+type BlockGraph = block_graph::BlockGraph<Header>;
+
+fn header(prev_blockhash: BlockHash, nonce: Option<u32>) -> Header {
+    Header {
+        version: bitcoin::block::Version::default(),
+        merkle_root: TxMerkleNode::all_zeros(),
+        time: 1234567,
+        bits: pow::Target::MAX_ATTAINABLE_REGTEST.to_compact_lossy(),
+        nonce: nonce.unwrap_or_default(),
+        prev_blockhash,
+    }
+}
 
 fn is_block_in_chain(c: &mut Criterion) {
     // Initialize blockgraph
-    let mut block_graph = BlockGraph::from_genesis(Hash::hash(b"0"));
+    let genesis = header(BlockHash::all_zeros(), Some(0));
+    let mut block_graph = BlockGraph::from_genesis(genesis);
     let mut cp = block_graph.tip();
 
     // Insert block into blockgraph
     for height in 1..=CT as u32 {
-        let hash: BlockHash = Hash::hash(height.to_string().as_bytes());
-        cp = cp.push(height, hash).unwrap();
+        let h = header(cp.hash(), Some(height));
+        cp = cp.push(height, h).unwrap();
     }
     let _ = block_graph.apply_update(cp).unwrap();
 
