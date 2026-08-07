@@ -1,6 +1,5 @@
 use std::hint::black_box;
 
-use bdk_chain::bitcoin;
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
 use criterion::Criterion;

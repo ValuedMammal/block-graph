@@ -6,6 +6,22 @@ rust-version = "1.85.0"
 readme = "README.md"
 
 
+[dependencies]
+bitcoin = { version = "0.32", default-features = false }
+serde = { version = "1", default-features = false, features = ["derive"], optional = true }
+
+[features]
+default = ["std", "serde"]
+std = ["bitcoin/std", "bitcoin/serde"]
+serde = ["dep:serde"]
+
+[dev-dependencies.block_graph]
+path = "."
+default-features = true
+
+[dev-dependencies]
+criterion = "0.7"
+
 [[bench]]
 name = "apply_update"
 harness = false
@@ -21,18 +37,3 @@ harness = false
 [[bench]]
 name = "reorg"
 harness = false
-
-[dependencies]
-bdk_chain = { git = "https://github.com/bitcoindevkit/bdk", rev = "47556ab7094c6af5c500eda9c9fa43f6d1804563" }
-serde = { version = "1", default-features = false, features = ["derive"], optional = true }
-
-[features]
-default = ["std", "serde"]
-std = ["bdk_chain/std"]
-serde = ["dep:serde", "bdk_chain/serde"]
-
-[dev-dependencies.block_graph]
-path = "."
-
-[dev-dependencies]
-criterion = "0.7"

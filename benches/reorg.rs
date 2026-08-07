@@ -4,7 +4,6 @@
 
 use std::hint::black_box;
 
-use bdk_chain::bitcoin;
 use bitcoin::block::Header;
 use bitcoin::hashes::Hash;
 use bitcoin::pow;

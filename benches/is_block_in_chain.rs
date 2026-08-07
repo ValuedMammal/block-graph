@@ -1,11 +1,11 @@
 use std::hint::black_box;
 
-use bdk_chain::BlockId;
-use bdk_chain::{bitcoin, ChainOracle};
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
 use criterion::Criterion;
 use criterion::{criterion_group, criterion_main};
+
+use block_graph::BlockId;
 
 const CT: usize = 50_000;
 
@@ -35,7 +35,7 @@ fn is_block_in_chain(c: &mut Criterion) {
     c.bench_function("is_block_in_chain", move |b| {
         b.iter(|| {
             let result = block_graph.is_block_in_chain(black_box(test_block), black_box(chain_tip));
-            assert!(matches!(result, Ok(Some(true))));
+            assert!(matches!(result, Some(true)));
         });
     });
 }

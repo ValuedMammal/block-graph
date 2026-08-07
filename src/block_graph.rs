@@ -15,11 +15,10 @@ use core::cmp::Ordering;
 use core::fmt::{self, Debug, Display};
 use core::ops::RangeBounds;
 
-use bdk_chain::{bitcoin, BlockId, ChainOracle, CheckPoint, Merge, ToBlockHash};
 use bitcoin::{hashes::Hash, BlockHash};
 
+use crate::checkpoint::{BlockId, CheckPoint, ToBlockHash};
 use crate::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use crate::CheckPointExt;
 
 /// Block graph.
 #[derive(Debug, Clone)]
@@ -408,21 +407,17 @@ impl<T: Debug + Clone + PartialEq> PartialEq for BlockGraph<T> {
     }
 }
 
-impl<T: ToBlockHash + PartialEq + Debug + Clone> ChainOracle for BlockGraph<T> {
-    type Error = core::convert::Infallible;
-
-    fn get_chain_tip(&self) -> Result<BlockId, Self::Error> {
-        Ok(self.tip().block_id())
+impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
+    /// Get chain tip
+    pub fn get_chain_tip(&self) -> BlockId {
+        self.tip().block_id()
     }
 
-    fn is_block_in_chain(
-        &self,
-        block: BlockId,
-        chain_tip: BlockId,
-    ) -> Result<Option<bool>, Self::Error> {
+    /// Is block in chain
+    pub fn is_block_in_chain(&self, block: BlockId, chain_tip: BlockId) -> Option<bool> {
         // `block` height must be within that of `chain_tip`.
         if block.height > chain_tip.height {
-            return Ok(None);
+            return None;
         }
         // `chain_tip` must exist in chain.
         if self
@@ -430,24 +425,27 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> ChainOracle for BlockGraph<T> {
             .get(chain_tip.height)
             .is_none_or(|cp| cp.value().to_blockhash() != chain_tip.hash)
         {
-            return Ok(None);
+            return None;
         }
         // A block of given height must exist in this chain, and the hashes must match.
-        match self.tip.get(block.height) {
-            Some(cp) => Ok(Some(cp.value().to_blockhash() == block.hash)),
-            None => Ok(None),
-        }
+        self.tip
+            .get(block.height)
+            .map(|cp| cp.value().to_blockhash() == block.hash)
     }
 }
 
 /// A changeset representing modifications to a [`BlockGraph`].
 ///
 /// Contains the set of blocks to be added to the graph, along with their parent relationships.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize)]
-#[serde(bound(
-    serialize = "T: serde::Serialize",
-    deserialize = "T: for<'d> serde::Deserialize<'d>",
-))]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Deserialize, serde::Serialize),
+    serde(bound(
+        serialize = "T: serde::Serialize",
+        deserialize = "T: for<'d> serde::Deserialize<'d>"
+    ))
+)]
 pub struct ChangeSet<T> {
     /// Map from block hash to `(height, value)`.
     pub blocks: BTreeMap<BlockHash, (u32, T)>,
@@ -464,12 +462,15 @@ impl<T> Default for ChangeSet<T> {
     }
 }
 
-impl<T> Merge for ChangeSet<T> {
-    fn merge(&mut self, other: Self) {
+impl<T> ChangeSet<T> {
+    /// Merge
+    pub fn merge(&mut self, other: Self) {
         self.blocks.extend(other.blocks);
         self.edges.extend(other.edges);
     }
-    fn is_empty(&self) -> bool {
+
+    /// Is empty
+    pub fn is_empty(&self) -> bool {
         self.blocks.is_empty() && self.edges.is_empty()
     }
 }
@@ -497,7 +498,7 @@ where
                         Ordering::Greater => {
                             items_to_connect.push((
                                 update.block_id(),
-                                update.value(),
+                                update.value().clone(),
                                 update.prev().as_ref().map(CheckPoint::hash),
                             ));
                             update_iter.next();
@@ -515,7 +516,7 @@ where
                                     if !self.blocks.contains_key(&prev_hash) {
                                         items_to_connect.push((
                                             update.block_id(),
-                                            update.value(),
+                                            update.value().clone(),
                                             Some(prev_hash),
                                         ));
                                     }
@@ -527,7 +528,7 @@ where
                             } else {
                                 items_to_connect.push((
                                     update.block_id(),
-                                    update.value(),
+                                    update.value().clone(),
                                     update.prev().as_ref().map(CheckPoint::hash),
                                 ));
                             }
@@ -635,7 +636,7 @@ mod test {
     where
         T: ToBlockHash + Clone + Debug,
     {
-        CheckPoint::from_blocks(blocks).expect("failed to create CheckPoint")
+        CheckPoint::from_entries(blocks).expect("failed to create CheckPoint")
     }
 
     #[test]
@@ -820,7 +821,7 @@ mod test {
         let chain_tip = graph.tip().block_id();
         assert_eq!(chain_tip, block_2);
         for block in [genesis_block, block_1, block_2] {
-            assert!(matches!(graph.is_block_in_chain(block, chain_tip), Ok(Some(true))))
+            assert!(matches!(graph.is_block_in_chain(block, chain_tip), Some(true)))
         }
         assert!(
             matches!(
@@ -831,7 +832,7 @@ mod test {
                     },
                     chain_tip
                 ),
-                Ok(Some(false))
+                Some(false)
             ),
             "block of wrong hash cannot be in chain"
         );
@@ -844,7 +845,6 @@ mod test {
                     },
                     chain_tip
                 )
-                .unwrap()
                 .is_none(),
             "block height past tip cannot be in chain"
         );
