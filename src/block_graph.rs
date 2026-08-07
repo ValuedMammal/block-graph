@@ -113,24 +113,28 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
         if changeset.blocks.is_empty() {
             return Ok(None);
         }
-        let (_, genesis_value, _) = changeset
+        let (_, genesis_value) = changeset
             .blocks
             .values()
-            .find(|(height, _, _)| *height == 0)
+            .find(|(height, _)| *height == 0)
             .ok_or(FromChangeSetError::MissingGenesis)?;
 
         let mut graph = Self::from_genesis(genesis_value.clone());
 
-        // Populate blocks and next_hashes from all changeset entries.
-        for (&hash, (height, value, parent_hash)) in &changeset.blocks {
+        // Populate blocks from changeset blocks
+        for (&hash, (height, value)) in &changeset.blocks {
             graph.blocks.insert(hash, (*height, value.clone()));
-            graph.next_hashes.entry(*parent_hash).or_default().insert(hash);
+        }
+
+        // Populate next_hashes from changeset edges
+        for &(parent_hash, child_hash) in &changeset.edges {
+            graph.next_hashes.entry(parent_hash).or_default().insert(child_hash);
         }
 
         // Second pass to populate parents now that all blocks are in graph.
-        for (&hash, (_, _, parent_hash)) in &changeset.blocks {
-            if let Some(parent_id) = graph.block_id(parent_hash) {
-                graph.parents.entry(hash).or_default().insert(parent_id);
+        for &(parent_hash, child_hash) in &changeset.edges {
+            if let Some(parent_id) = graph.block_id(&parent_hash) {
+                graph.parents.entry(child_hash).or_default().insert(parent_id);
             }
         }
 
@@ -197,14 +201,13 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
     pub fn initial_changeset(&self) -> ChangeSet<T> {
         let mut changeset = ChangeSet::default();
 
-        for (parent_hash, child_hashes) in &self.next_hashes {
+        for (&hash, (height, value)) in &self.blocks {
+            changeset.blocks.insert(hash, (*height, value.clone()));
+        }
+
+        for (&parent_hash, child_hashes) in &self.next_hashes {
             for &block_hash in child_hashes {
-                let (height, value) = self
-                    .blocks
-                    .get(&block_hash)
-                    .cloned()
-                    .expect("Every next hash must have a corresponding blocks entry");
-                changeset.blocks.insert(block_hash, (height, value, *parent_hash));
+                changeset.edges.insert((parent_hash, block_hash));
             }
         }
 
@@ -289,7 +292,8 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
             self.parents.entry(hash).or_default().insert(parent_id);
         }
 
-        changeset.blocks.insert(hash, (height, value, prev_hash));
+        changeset.blocks.insert(hash, (height, value));
+        changeset.edges.insert((prev_hash, hash));
 
         Ok(changeset)
     }
@@ -389,31 +393,34 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> ChainOracle for BlockGraph<T> {
 /// A changeset representing modifications to a [`BlockGraph`].
 ///
 /// Contains the set of blocks to be added to the graph, along with their parent relationships.
-/// Each block entry is a tuple of `(block_id, block_data, parent_hash)`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize)]
 #[serde(bound(
     serialize = "T: serde::Serialize",
     deserialize = "T: for<'d> serde::Deserialize<'d>",
 ))]
 pub struct ChangeSet<T> {
-    /// Map from block hash to `(height, value, parent_hash)`.
-    pub blocks: BTreeMap<BlockHash, (u32, T, BlockHash)>,
+    /// Map from block hash to `(height, value)`.
+    pub blocks: BTreeMap<BlockHash, (u32, T)>,
+    /// Set of `(parent_hash, child_hash)` edges.
+    pub edges: BTreeSet<(BlockHash, BlockHash)>,
 }
 
 impl<T> Default for ChangeSet<T> {
     fn default() -> Self {
         Self {
             blocks: Default::default(),
+            edges: Default::default(),
         }
     }
 }
 
 impl<T> Merge for ChangeSet<T> {
     fn merge(&mut self, other: Self) {
-        self.blocks.extend(other.blocks)
+        self.blocks.extend(other.blocks);
+        self.edges.extend(other.edges);
     }
     fn is_empty(&self) -> bool {
-        self.blocks.is_empty()
+        self.blocks.is_empty() && self.edges.is_empty()
     }
 }
 
@@ -604,12 +611,11 @@ mod test {
         assert_eq!(changeset.blocks.len(), 3);
         assert_eq!(
             changeset.blocks,
-            [
-                (hash_1, (1, hash_1, genesis_block.hash)),
-                (hash_2, (2, hash_2, hash_1)),
-                (hash_3, (3, hash_3, hash_2)),
-            ]
-            .into()
+            [(hash_1, (1, hash_1)), (hash_2, (2, hash_2)), (hash_3, (3, hash_3))].into()
+        );
+        assert_eq!(
+            changeset.edges,
+            [(genesis_block.hash, hash_1), (hash_1, hash_2), (hash_2, hash_3),].into()
         );
     }
 
@@ -682,8 +688,9 @@ mod test {
         assert_eq!(changeset.blocks.len(), 1);
         assert_eq!(
             changeset.blocks,
-            [(block_1.hash, (block_1.height, block_1.hash, genesis_block.hash))].into()
+            [(block_1.hash, (block_1.height, block_1.hash))].into()
         );
+        assert_eq!(changeset.edges, [(genesis_block.hash, block_1.hash)].into());
     }
 
     #[test]
@@ -710,10 +717,14 @@ mod test {
         assert_eq!(
             changeset.blocks,
             [
-                (block_1.hash, (block_1.height, block_1.hash, genesis_block.hash)),
-                (block_2.hash, (block_2.height, block_2.hash, block_1.hash)),
+                (block_1.hash, (block_1.height, block_1.hash)),
+                (block_2.hash, (block_2.height, block_2.hash)),
             ]
             .into(),
+        );
+        assert_eq!(
+            changeset.edges,
+            [(genesis_block.hash, block_1.hash), (block_1.hash, block_2.hash)].into(),
         );
     }
 
@@ -733,12 +744,15 @@ mod test {
         };
         let changeset = ChangeSet {
             blocks: [
-                (
-                    genesis_block.hash,
-                    (genesis_block.height, genesis_block.hash, BlockHash::all_zeros()),
-                ),
-                (block_1.hash, (block_1.height, block_1.hash, genesis_block.hash)),
-                (block_2.hash, (block_2.height, block_2.hash, block_1.hash)),
+                (genesis_block.hash, (genesis_block.height, genesis_block.hash)),
+                (block_1.hash, (block_1.height, block_1.hash)),
+                (block_2.hash, (block_2.height, block_2.hash)),
+            ]
+            .into(),
+            edges: [
+                (BlockHash::all_zeros(), genesis_block.hash),
+                (genesis_block.hash, block_1.hash),
+                (block_1.hash, block_2.hash),
             ]
             .into(),
         };
@@ -809,11 +823,16 @@ mod test {
         assert_eq!(
             changeset.blocks,
             [
-                (block_1.hash, (block_1.height, block_1.hash, genesis_hash)),
-                (block_2.hash, (block_2.height, block_2.hash, block_1.hash)),
+                (block_1.hash, (block_1.height, block_1.hash)),
+                (block_2.hash, (block_2.height, block_2.hash)),
             ]
             .into(),
             "Expected changeset to contain blocks 1 and 2"
+        );
+        assert_eq!(
+            changeset.edges,
+            [(genesis_hash, block_1.hash), (block_1.hash, block_2.hash)].into(),
+            "Expected changeset to contain edges for blocks 1 and 2"
         );
 
         // Canonical chain should remain unchanged
@@ -848,10 +867,8 @@ mod test {
 
         // Verify changeset
         assert_eq!(changeset.blocks.len(), 1);
-        assert_eq!(
-            changeset.blocks,
-            [(block_1_hash, (1u32, block_1_hash, genesis_hash))].into()
-        );
+        assert_eq!(changeset.blocks, [(block_1_hash, (1u32, block_1_hash))].into());
+        assert_eq!(changeset.edges, [(genesis_hash, block_1_hash)].into());
     }
 
     #[test]
@@ -874,11 +891,13 @@ mod test {
         // Verify changeset contains all 3 blocks
         assert_eq!(changeset.blocks.len(), 3);
         let expected_blocks = [
-            (hash_1, (1u32, hash_1, genesis_hash)),
-            (hash_2, (2u32, hash_2, hash_1)),
-            (hash_3, (3u32, hash_3, hash_2)),
+            (hash_1, (1u32, hash_1)),
+            (hash_2, (2u32, hash_2)),
+            (hash_3, (3u32, hash_3)),
         ];
         assert_eq!(changeset.blocks, expected_blocks.into());
+        let expected_edges = [(genesis_hash, hash_1), (hash_1, hash_2), (hash_2, hash_3)];
+        assert_eq!(changeset.edges, expected_edges.into());
     }
 
     #[test]
@@ -938,7 +957,8 @@ mod test {
 
         // Verify second changeset
         assert_eq!(changeset2.blocks.len(), 1);
-        assert_eq!(changeset2.blocks, [(hash_3, (3u32, hash_3, hash_2))].into());
+        assert_eq!(changeset2.blocks, [(hash_3, (3u32, hash_3))].into());
+        assert_eq!(changeset2.edges, [(hash_2, hash_3)].into());
     }
 
     #[test]
@@ -951,7 +971,8 @@ mod test {
 
         // Connect block 1
         let cs = graph.connect_block(1, hash_1, genesis_hash).unwrap();
-        assert_eq!(cs.blocks, [(hash_1, (1u32, hash_1, genesis_hash))].into());
+        assert_eq!(cs.blocks, [(hash_1, (1u32, hash_1))].into());
+        assert_eq!(cs.edges, [(genesis_hash, hash_1)].into());
         assert!(
             graph
                 .blocks
@@ -971,7 +992,8 @@ mod test {
 
         // Connect block 2
         let cs = graph.connect_block(2, hash_2, hash_1).unwrap();
-        assert_eq!(cs.blocks, [(hash_2, (2u32, hash_2, hash_1))].into());
+        assert_eq!(cs.blocks, [(hash_2, (2u32, hash_2))].into());
+        assert_eq!(cs.edges, [(hash_1, hash_2)].into());
         assert!(
             graph
                 .blocks
@@ -1025,7 +1047,8 @@ mod test {
 
         // Should create a single block at height 3 connecting to genesis
         assert_eq!(changeset.blocks.len(), 1);
-        assert_eq!(changeset.blocks, [(hash_3, (3u32, hash_3, genesis_hash))].into());
+        assert_eq!(changeset.blocks, [(hash_3, (3u32, hash_3))].into());
+        assert_eq!(changeset.edges, [(genesis_hash, hash_3)].into());
     }
 
     #[test]
@@ -1105,10 +1128,17 @@ mod test {
         // Create blockgraph
         let changeset = ChangeSet {
             blocks: [
-                (hash_0, (0u32, hash_0, BlockHash::all_zeros())),
-                (hash_1, (1u32, hash_1, hash_0)),
-                (hash_2, (2u32, hash_2, hash_1)),
-                (hash_3, (3u32, hash_3, hash_2)),
+                (hash_0, (0u32, hash_0)),
+                (hash_1, (1u32, hash_1)),
+                (hash_2, (2u32, hash_2)),
+                (hash_3, (3u32, hash_3)),
+            ]
+            .into(),
+            edges: [
+                (BlockHash::all_zeros(), hash_0),
+                (hash_0, hash_1),
+                (hash_1, hash_2),
+                (hash_2, hash_3),
             ]
             .into(),
         };
@@ -1176,8 +1206,13 @@ mod test {
         // Verify the changeset contains the correct block
         assert_eq!(
             changeset.blocks,
-            [(new_block_hash, (new_height, new_block_hash, original_tip_hash))].into(),
+            [(new_block_hash, (new_height, new_block_hash))].into(),
             "Changeset should contain the new block connecting to the original tip"
+        );
+        assert_eq!(
+            changeset.edges,
+            [(original_tip_hash, new_block_hash)].into(),
+            "Changeset should contain the edge connecting to the original tip"
         );
 
         // Verify that only 1 new block was processed

@@ -25,7 +25,8 @@ fn from_changeset(c: &mut Criterion) {
     for i in 0..CT {
         let height = i as u32;
         let hash = Hash::hash(height.to_be_bytes().as_slice());
-        changeset.blocks.insert(hash, (height, hash, parent_hash));
+        changeset.blocks.insert(hash, (height, hash));
+        changeset.edges.insert((parent_hash, hash));
         // update next parent id.
         parent_hash = hash;
     }

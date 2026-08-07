@@ -18,7 +18,8 @@ fn bench_apply_update(c: &mut Criterion) {
     for i in 0..CT {
         let height = i;
         let hash = Hash::hash(height.to_string().as_bytes());
-        changeset.blocks.insert(hash, (height, hash, prev_hash));
+        changeset.blocks.insert(hash, (height, hash));
+        changeset.edges.insert((prev_hash, hash));
         prev_hash = hash;
     }
 
