@@ -4,10 +4,9 @@ This document outlines the rationale behind the design choices made in the imple
 
 ## Rationale
 
-**Why develop BlockGraph when we already have LocalChain?**
+**Why develop BlockGraph?**
 
-Currently changes to LocalChain are [not monotone](<https://github.com/bitcoindevkit/bdk_wallet/issues/148>).
-Why is this a desirable property of the local chain? So that we don't lose the ability to query the chain for historical information about a block whether or not it is part of the best chain. Also since the change set is directly implicated in this effort it makes sense to design a new type that can be adopted slowly and minimize disruption to existing APIs in BDK.
+The primary design goal of BlockGraph is to maintain a **monotone structure**: once data is added, it is never removed or modified. This approach preserves all historical information about blocks, enabling queries about any block—whether it's part of the current canonical chain or a disconnected fork—without loss of historical context. By treating the chain as an append-only data structure, BlockGraph ensures that queries remain stable over time.
 
 **Why model a DAG?**
 
