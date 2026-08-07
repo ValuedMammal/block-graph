@@ -156,7 +156,7 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
     /// collection of `(height, value)` tuples in ascending height order.
     ///
     /// Note: The caller must ensure that `root` exists in the current active chain.
-    fn canonicalize(&mut self, root: BlockHash) -> Vec<(u32, T)> {
+    fn canonicalize(&self, root: BlockHash) -> Vec<(u32, T)> {
         // Find the possible tips by exploring `.next_hashes` starting from the root.
         let mut tips = HashSet::<BlockHash>::new();
         let mut queue = vec![];
@@ -251,35 +251,48 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
     /// # Errors
     ///
     /// - If the parent with `prev_hash` doesn't exist at a strictly lower height than
-    ///   the `height` being connected.
+    ///   the `height` being connected. The graph is left unchanged in that case.
     pub fn connect_block(
         &mut self,
         height: u32,
         value: T,
         prev_hash: BlockHash,
     ) -> Result<ChangeSet<T>, ConnectBlockError> {
+        if !self.is_connected(height, &value, &prev_hash) {
+            check_parent_height(height, self.blocks.get(&prev_hash).map(|(height, _)| *height))?;
+        }
+
+        Ok(self.connect_block_unchecked(height, value, prev_hash))
+    }
+
+    /// Whether `value` at `height` extending from `prev_hash` is already recorded.
+    fn is_connected(&self, height: u32, value: &T, prev_hash: &BlockHash) -> bool {
         let hash = value.to_blockhash();
 
-        // Already recorded with the same height and parent.
-        if self
-            .blocks
+        self.blocks
             .get(&hash)
             .is_some_and(|(existing_height, existing_value)| {
-                existing_height == &height && existing_value == &value
+                existing_height == &height && existing_value == value
             })
             // The same parent-child dependency exists
-            && self.next_hashes.get(&prev_hash).is_some_and(|set| set.contains(&hash))
-        {
-            return Ok(ChangeSet::default());
+            && self.next_hashes.get(prev_hash).is_some_and(|set| set.contains(&hash))
+    }
+
+    /// Connects a value of `T` at `height` to `prev_hash` without validating the parent height.
+    ///
+    /// The caller must have already validated the connection with [`check_parent_height`].
+    fn connect_block_unchecked(
+        &mut self,
+        height: u32,
+        value: T,
+        prev_hash: BlockHash,
+    ) -> ChangeSet<T> {
+        if self.is_connected(height, &value, &prev_hash) {
+            return ChangeSet::default();
         }
 
-        // If a parent exists in graph it must have a smaller height
+        let hash = value.to_blockhash();
         let parent_opt = self.block_id(&prev_hash);
-        if let Some(parent_id) = parent_opt {
-            if parent_id.height >= height {
-                return Err(ConnectBlockError::ParentHeightNotSmaller);
-            }
-        }
 
         let mut changeset = ChangeSet::default();
 
@@ -295,7 +308,31 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
         changeset.blocks.insert(hash, (height, value));
         changeset.edges.insert((prev_hash, hash));
 
-        Ok(changeset)
+        changeset
+    }
+
+    /// Validate that every item of `items` can be connected, assuming the items are
+    /// connected in the given order.
+    fn validate_connections(
+        &self,
+        items: &[(BlockId, T, BlockHash)],
+    ) -> Result<(), ConnectBlockError> {
+        // Connecting a block overwrites its height, so the heights staged by preceding
+        // items take precedence over the ones currently in the graph.
+        let mut staged = HashMap::<BlockHash, u32>::new();
+
+        for (block_id, value, prev_hash) in items {
+            if !self.is_connected(block_id.height, value, prev_hash) {
+                let parent_height = staged
+                    .get(prev_hash)
+                    .copied()
+                    .or_else(|| self.blocks.get(prev_hash).map(|(height, _)| *height));
+                check_parent_height(block_id.height, parent_height)?;
+            }
+            staged.insert(value.to_blockhash(), block_id.height);
+        }
+
+        Ok(())
     }
 
     /// Applies a [`CheckPoint`] update to the [`BlockGraph`] and returns the resulting [`ChangeSet`].
@@ -305,7 +342,9 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
     ///
     /// Errors if a checkpoint item doesn't declare its parent, indicating no common ancestor
     /// was found between `checkpoint` and this `BlockGraph`.
-    /// Or if `connect_block` returns an error due to an invalid parent-child dependency.
+    /// Or if an item can't be connected due to an invalid parent-child dependency.
+    /// All items are validated before any of them are applied, so the graph is left
+    /// unchanged if an error is returned.
     pub fn apply_update(
         &mut self,
         checkpoint: CheckPoint<T>,
@@ -313,15 +352,26 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
     where
         T: ToBlockHash + Clone,
     {
-        let mut changeset = ChangeSet::default();
         let mut items = self.merge_chains(checkpoint);
         items.reverse();
+
+        // Every item must declare its parent, otherwise we don't know where the update connects.
+        let items = items
+            .into_iter()
+            .map(|(block_id, value, prev)| {
+                prev.map(|prev_hash| (block_id, value, prev_hash))
+                    .ok_or(ApplyUpdateError::MissingParent)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        self.validate_connections(&items)?;
+
         let from_hash = items.first().map(|(id, _, _)| id.hash);
-        // Connect each item in ascending height order. At this point all parent
-        // hashes must be known, otherwise we don't know where the update connects.
-        for (block_id, value, prev) in items {
-            let prev_hash = prev.ok_or(ApplyUpdateError::MissingParent)?;
-            changeset.merge(self.connect_block(block_id.height, value, prev_hash)?);
+
+        // Connect each item in ascending height order.
+        let mut changeset = ChangeSet::default();
+        for (block_id, value, prev_hash) in items {
+            changeset.merge(self.connect_block_unchecked(block_id.height, value, prev_hash));
         }
         // To update the canonical chain we need to re-canonicalize the graph
         // starting from the most recent common ancestor (i.e. "fork point").
@@ -511,6 +561,16 @@ impl Display for FromChangeSetError {
 }
 
 impl core::error::Error for FromChangeSetError {}
+
+/// The parent of a block must exist at a strictly lower height than the block itself.
+fn check_parent_height(height: u32, parent_height: Option<u32>) -> Result<(), ConnectBlockError> {
+    match parent_height {
+        Some(parent_height) if parent_height >= height => {
+            Err(ConnectBlockError::ParentHeightNotSmaller)
+        }
+        _ => Ok(()),
+    }
+}
 
 /// Error returned by [`BlockGraph::connect_block`].
 #[derive(Debug, PartialEq)]
@@ -1262,5 +1322,53 @@ mod test {
         let cp = CheckPoint::new(1, orphan_hash);
 
         assert_eq!(graph.apply_update(cp), Err(ApplyUpdateError::MissingParent));
+    }
+
+    #[test]
+    fn test_apply_update_error_leaves_graph_unchanged() {
+        let genesis_hash: BlockHash = Hash::hash(b"0");
+        let mut graph = BlockGraph::from_genesis(genesis_hash);
+
+        let mut cp = graph.tip();
+        for height in 1u32..=3 {
+            cp = cp.push(height, Hash::hash(height.to_string().as_bytes())).unwrap();
+        }
+        graph.apply_update(cp).unwrap();
+
+        let before = graph.clone();
+        let before_parents = graph.parents.clone();
+
+        let orphan_hash = Hash::hash(b"orphan");
+        assert_eq!(
+            graph.apply_update(CheckPoint::new(4, orphan_hash)),
+            Err(ApplyUpdateError::MissingParent),
+        );
+
+        assert_eq!(graph, before, "a failed update must not mutate the graph");
+        assert_eq!(graph.parents, before_parents);
+        assert!(!graph.blocks.contains_key(&orphan_hash));
+    }
+
+    #[test]
+    fn test_connect_block_error_leaves_graph_unchanged() {
+        let genesis_hash: BlockHash = Hash::hash(b"0");
+        let mut graph = BlockGraph::from_genesis(genesis_hash);
+
+        // A block at height 5 that can't be the parent of a lower block.
+        let hash_5 = Hash::hash(b"5");
+        graph.connect_block(5, hash_5, genesis_hash).unwrap();
+
+        let before = graph.clone();
+        let before_parents = graph.parents.clone();
+
+        let hash_3 = Hash::hash(b"3");
+        assert_eq!(
+            graph.connect_block(3, hash_3, hash_5),
+            Err(ConnectBlockError::ParentHeightNotSmaller),
+        );
+
+        assert_eq!(graph, before, "a failed connection must not mutate the graph");
+        assert_eq!(graph.parents, before_parents);
+        assert!(!graph.blocks.contains_key(&hash_3));
     }
 }
