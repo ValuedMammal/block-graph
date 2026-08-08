@@ -5,6 +5,9 @@ edition = "2021"
 rust-version = "1.85.0"
 readme = "README.md"
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
 
 [dependencies]
 bitcoin = { version = "0.32", default-features = false }

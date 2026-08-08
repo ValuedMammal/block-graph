@@ -503,8 +503,8 @@ impl<T: Block + PartialEq + Debug + Clone> BlockGraph<T> {
     }
 }
 
-/// Invariant checks used by tests.
-#[cfg(test)]
+/// Invariant checks used by tests and the fuzz harness.
+#[cfg(any(test, fuzzing))]
 impl<T: Block + PartialEq + Debug + Clone> BlockGraph<T> {
     /// Check structural invariants that must hold at all times.
     #[doc(hidden)]

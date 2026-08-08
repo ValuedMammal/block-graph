@@ -1,0 +1,47 @@
+[package]
+name = "block-graph-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = "0.4"
+bitcoin = { version = "0.32", default-features = false, features = ["std"] }
+
+[dependencies.block_graph]
+path = ".."
+
+[[bin]]
+name = "from_changeset"
+path = "fuzz_targets/from_changeset.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "connect_block"
+path = "fuzz_targets/connect_block.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "apply_update"
+path = "fuzz_targets/apply_update.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "checkpoint_ops"
+path = "fuzz_targets/checkpoint_ops.rs"
+test = false
+doc = false
+bench = false
