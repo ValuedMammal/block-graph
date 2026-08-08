@@ -715,6 +715,15 @@ mod test {
         let _ = cp.insert_connected(0, other_genesis);
     }
 
+    // A canary for the hand-written iterative `Drop for Node<T>`: dropping a deep chain via the
+    // derived/recursive impl would stack-overflow (a hard crash, not a normal test failure), so
+    // simply reaching the end of this test is the assertion.
+    #[test]
+    fn drop_deep_chain_does_not_stack_overflow() {
+        let cp = dense_chain(100_000);
+        drop(cp);
+    }
+
     // --- Skip-pointer machinery ---
 
     #[test]

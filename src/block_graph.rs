@@ -100,6 +100,7 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
     /// Construct a [`BlockGraph`] from a [`ChangeSet`]. Returns `None` if `changeset` is empty.
     ///
     /// This method rebuilds the block graph from a changeset by:
+    ///
     /// 1. Finding the genesis block (height 0)
     /// 2. Building the graph structure with parent-child relationships
     /// 3. Determining the canonical chain tip
@@ -107,16 +108,26 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
     ///
     /// # Errors
     ///
-    /// Returns [`FromChangeSetError`] if no block at height 0 exists in the changeset.
+    /// Returns [`FromChangeSetError::MissingGenesis`] if no block at height 0 exists in the
+    /// changeset, [`FromChangeSetError::MultipleGenesisBlocks`] if more than one distinct block
+    /// is declared at height 0, or [`FromChangeSetError::InvalidEdgeHeight`] if an edge's
+    /// declared parent (when present in `changeset.blocks`) is not at a strictly lower height
+    /// than its child.
     pub fn from_changeset(changeset: ChangeSet<T>) -> Result<Option<Self>, FromChangeSetError> {
         if changeset.blocks.is_empty() {
             return Ok(None);
         }
-        let (_, genesis_value) = changeset
-            .blocks
-            .values()
-            .find(|(height, _)| *height == 0)
-            .ok_or(FromChangeSetError::MissingGenesis)?;
+        let mut genesis_blocks = changeset.blocks.iter().filter(|(_, (height, _))| *height == 0);
+        let (&genesis_hash, (_, genesis_value)) =
+            genesis_blocks.next().ok_or(FromChangeSetError::MissingGenesis)?;
+        if let Some((&other_hash, _)) = genesis_blocks.next() {
+            return Err(FromChangeSetError::MultipleGenesisBlocks {
+                first: genesis_hash,
+                second: other_hash,
+            });
+        }
+
+        check_changeset_edge_heights(&changeset)?;
 
         let mut graph = Self::from_genesis(genesis_value.clone());
 
@@ -125,13 +136,16 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
             graph.blocks.insert(hash, (*height, value.clone()));
         }
 
-        // Populate next_hashes from changeset edges
+        // Populate next_hashes and parents from changeset edges. An edge's parent may
+        // legitimately be a hash with no block data (e.g. the sentinel predecessor of genesis,
+        // or a gapped connection's declared-but-absent parent), but a child with no block data
+        // describes no real relationship, so such edges are dropped entirely rather than left
+        // dangling in `next_hashes`/`parents`.
         for &(parent_hash, child_hash) in &changeset.edges {
+            if !graph.blocks.contains_key(&child_hash) {
+                continue;
+            }
             graph.next_hashes.entry(parent_hash).or_default().insert(child_hash);
-        }
-
-        // Second pass to populate parents now that all blocks are in graph.
-        for &(parent_hash, child_hash) in &changeset.edges {
             if let Some(parent_id) = graph.block_id(&parent_hash) {
                 graph.parents.entry(child_hash).or_default().insert(parent_id);
             }
@@ -140,6 +154,7 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
         let items = graph.canonicalize(graph.root);
         graph.tip = graph.tip.extend(items).expect("tip height must only increase");
 
+        // TODO(@valuedmammal): Can this call out to "check-invariants" ?
         debug_assert!(
             graph
                 .tip
@@ -157,11 +172,21 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
     /// Note: The caller must ensure that `root` exists in the current active chain.
     fn canonicalize(&self, root: BlockHash) -> Vec<(u32, T)> {
         // Find the possible tips by exploring `.next_hashes` starting from the root.
+        //
+        // `visited` guards against re-queuing a hash whose children were already expanded.
+        // Without it, diamond-shaped DAGs (a common shape once skip-chain edges exist) are
+        // re-traversed once per incoming path, and a cyclic edge (e.g. corrupt or adversarial
+        // data ingested via `from_changeset`) sends this into an infinite loop rather than just
+        // being slow.
+        let mut visited = HashSet::<BlockHash>::new();
         let mut tips = HashSet::<BlockHash>::new();
         let mut queue = vec![];
         queue.push(root);
 
         while let Some(hash) = queue.pop() {
+            if !visited.insert(hash) {
+                continue;
+            }
             match self.next_hashes.get(&hash) {
                 Some(next_hashes) => {
                     queue.extend(next_hashes);
@@ -216,18 +241,15 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
     /// Find the best parent [`BlockId`] of the given `hash` if it exists in `self.parents`.
     ///
     /// The "best" parent is the one with the highest order [`BlockId`].
+    ///
+    /// Open design question: it's not established that "highest order" (by `(height, hash)`) is
+    /// always the *correct* choice for reconstructing actual ancestry when a block has more than
+    /// one recorded parent, versus e.g. "whichever parent was most recently recorded". A block
+    /// with two legitimate, same-height parents at a non-root height isn't currently caught by
+    /// any validation, so this could in principle pick the "wrong" one without violating
+    /// `check_invariants`/`check_best_tip`.
     fn parent(&self, hash: &BlockHash) -> Option<BlockId> {
         self.parents.get(hash)?.iter().last().copied()
-    }
-
-    /// Locates the most recent common ancestor between `self.tip` and the given block `hash`,
-    /// if one exists.
-    fn find_fork_point(&self, hash: BlockHash) -> Option<BlockHash> {
-        self.iter_block_graph(hash)
-            .find_map(|(height, hash, _value)| match self.tip.get(height) {
-                Some(checkpoint) if checkpoint.hash() == hash => Some(hash),
-                _ => None,
-            })
     }
 
     /// Iterate over `(height, blockhash, value)` tuples in the [`BlockGraph`] starting from the given [`BlockHash`].
@@ -258,7 +280,18 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
         prev_hash: BlockHash,
     ) -> Result<ChangeSet<T>, ConnectBlockError> {
         if !self.is_connected(height, &value, &prev_hash) {
-            check_parent_height(height, self.blocks.get(&prev_hash).map(|(height, _)| *height))?;
+            let hash = value.to_blockhash();
+            check_not_second_genesis(self.root, hash, height)?;
+            let existing_height = self.blocks.get(&hash).map(|(h, _)| *h);
+            check_height_unchanged(hash, height, existing_height)?;
+            if existing_height.is_none() {
+                self.check_no_child_height_violation(hash, height)?;
+            }
+            let parent_height = self.blocks.get(&prev_hash).map(|(h, _)| *h);
+            check_parent_height(
+                height,
+                self_parent_height(hash, prev_hash, height, parent_height),
+            )?;
         }
 
         Ok(self.connect_block_unchecked(height, value, prev_hash))
@@ -277,6 +310,35 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
             && self.next_hashes.get(prev_hash).is_some_and(|set| set.contains(&hash))
     }
 
+    /// `hash` may already be recorded as some other block's declared parent via `next_hashes`
+    /// (a gapped connection can reference a parent hash before that parent is ever connected as
+    /// an actual block). If so, connecting `hash` for the first time at `height` must not
+    /// retroactively put it at or above one of those already-connected children — otherwise the
+    /// parent/child height invariant would be violated the moment `hash` gets a committed
+    /// height. Only relevant the first time `hash` is connected, since its height can never
+    /// change afterward (see [`check_height_unchanged`]).
+    fn check_no_child_height_violation(
+        &self,
+        hash: BlockHash,
+        height: u32,
+    ) -> Result<(), ConnectBlockError> {
+        if let Some(children) = self.next_hashes.get(&hash) {
+            for &child_hash in children {
+                if let Some((child_height, _)) = self.blocks.get(&child_hash) {
+                    if height >= *child_height {
+                        return Err(ConnectBlockError::ChildHeightNotGreater {
+                            hash,
+                            height,
+                            child_hash,
+                            child_height: *child_height,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Connects a value of `T` at `height` to `prev_hash` without validating the parent height.
     ///
     /// The caller must have already validated the connection with [`check_parent_height`].
@@ -291,6 +353,7 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
         }
 
         let hash = value.to_blockhash();
+        let is_new_hash = !self.blocks.contains_key(&hash);
         let parent_opt = self.block_id(&prev_hash);
 
         let mut changeset = ChangeSet::default();
@@ -302,6 +365,19 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
         // Record prev as a parent of this block
         if let Some(parent_id) = parent_opt {
             self.parents.entry(hash).or_default().insert(parent_id);
+        }
+
+        // `hash` may already be recorded as some other block's declared parent from an earlier
+        // gapped connection (made before `hash` itself was known). Now that `hash` has a
+        // committed height, backfill `parents` for each of those children — otherwise they'd be
+        // stuck believing they have no known parent, even though one now exists.
+        if is_new_hash {
+            if let Some(children) = self.next_hashes.get(&hash).cloned() {
+                let this_id = BlockId { height, hash };
+                for child in children {
+                    self.parents.entry(child).or_default().insert(this_id);
+                }
+            }
         }
 
         changeset.blocks.insert(hash, (height, value));
@@ -316,19 +392,34 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
         &self,
         items: &[(BlockId, T, BlockHash)],
     ) -> Result<(), ConnectBlockError> {
-        // Connecting a block overwrites its height, so the heights staged by preceding
-        // items take precedence over the ones currently in the graph.
+        // Track each item's staged height so a later item that declares an earlier one as its
+        // parent sees its about-to-be-connected height rather than any stale height already in
+        // the graph, and so a hash connected twice within the same batch at conflicting heights
+        // is caught here rather than silently overwriting the first connection.
         let mut staged = HashMap::<BlockHash, u32>::new();
 
         for (block_id, value, prev_hash) in items {
+            let hash = value.to_blockhash();
             if !self.is_connected(block_id.height, value, prev_hash) {
+                check_not_second_genesis(self.root, hash, block_id.height)?;
+                let existing_height = staged
+                    .get(&hash)
+                    .copied()
+                    .or_else(|| self.blocks.get(&hash).map(|(h, _)| *h));
+                check_height_unchanged(hash, block_id.height, existing_height)?;
+                if existing_height.is_none() {
+                    self.check_no_child_height_violation(hash, block_id.height)?;
+                }
                 let parent_height = staged
                     .get(prev_hash)
                     .copied()
                     .or_else(|| self.blocks.get(prev_hash).map(|(height, _)| *height));
-                check_parent_height(block_id.height, parent_height)?;
+                check_parent_height(
+                    block_id.height,
+                    self_parent_height(hash, *prev_hash, block_id.height, parent_height),
+                )?;
             }
-            staged.insert(value.to_blockhash(), block_id.height);
+            staged.insert(hash, block_id.height);
         }
 
         Ok(())
@@ -376,29 +467,40 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
 
         validate(self, &items)?;
 
-        let from_hash = items.first().map(|(id, _, _)| id.hash);
-
         // Connect each item in ascending height order.
         let mut changeset = ChangeSet::default();
         for (block_id, value, prev_hash) in items {
             changeset.merge(self.connect_block_unchecked(block_id.height, value, prev_hash));
         }
-        // To update the canonical chain we need to re-canonicalize the graph
-        // starting from the most recent common ancestor (i.e. "fork point").
-        if let Some(hash) = from_hash {
-            if let Some(ancestor) = self.find_fork_point(hash) {
-                let old_tip = self.tip.block_id();
-                let mut new_tip = self.tip();
-                for (height, value) in self.canonicalize(ancestor) {
-                    new_tip = new_tip.insert(height, value.clone());
-                    // If the best tip didn't change we're done
-                    if new_tip.block_id() == old_tip {
-                        break;
-                    }
+
+        // Re-canonicalize from the root, not from a narrower "fork point" relative only to this
+        // update's own new items: the graph can already contain other, entirely unrelated
+        // branches (e.g. left by an earlier `connect_block` call, or a gapped/forward-referenced
+        // connection) that such a fork point would never discover, even when they're already the
+        // true best chain. This also means a no-op update (contributing nothing new) still
+        // surfaces an already-connected better chain that was never promoted.
+        //
+        // Reuse as much of the current tip chain as still matches the recomputed best chain,
+        // rebuilding only from the point where the two actually diverge (or where the best chain
+        // extends further) — this both preserves the `eq_ptr` structure-sharing callers may rely
+        // on and avoids reallocating the whole chain on every call.
+        let items = self.canonicalize(self.root);
+        let mut new_tip = self.tip.get(0).expect("tip chain must include the root");
+        let mut i = 0;
+        while i < items.len() {
+            let (height, value) = &items[i];
+            match self.tip.get(*height) {
+                Some(cp) if cp.hash() == value.to_blockhash() => {
+                    new_tip = cp;
+                    i += 1;
                 }
-                self.tip = new_tip;
+                _ => break,
             }
         }
+        for (height, value) in &items[i..] {
+            new_tip = new_tip.insert(*height, value.clone());
+        }
+        self.tip = new_tip;
         Ok(changeset)
     }
 
@@ -409,9 +511,174 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
     }
 }
 
+/// Invariant checks used by tests.
+#[cfg(test)]
+impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
+    /// Check structural invariants that must hold at all times.
+    #[doc(hidden)]
+    pub fn check_invariants(&self) -> Result<(), alloc::string::String> {
+        // 1. `root` exists in `blocks` at height 0.
+        match self.blocks.get(&self.root) {
+            Some((0, _)) => {}
+            Some((height, _)) => {
+                return Err(format!(
+                    "root {} is recorded at height {height}, expected 0",
+                    self.root
+                ))
+            }
+            None => return Err(format!("root {} is missing from blocks", self.root)),
+        }
+
+        // 2. every block's value hashes to its own key.
+        for (hash, (_, value)) in &self.blocks {
+            if value.to_blockhash() != *hash {
+                return Err(format!(
+                    "block {hash} has a value that hashes to {}",
+                    value.to_blockhash()
+                ));
+            }
+        }
+
+        // 3. every edge's child exists in `blocks`; if the parent is known, its height
+        // must be strictly less than the child's. The sentinel `BlockHash::all_zeros()`
+        // parent of genesis is not itself a block, so it's exempt from the height check.
+        for (parent_hash, children) in &self.next_hashes {
+            for child_hash in children {
+                let (child_height, _) = self.blocks.get(child_hash).ok_or_else(|| {
+                    format!("edge ({parent_hash}, {child_hash}): child is missing from blocks")
+                })?;
+                if let Some((parent_height, _)) = self.blocks.get(parent_hash) {
+                    if *parent_height >= *child_height {
+                        return Err(format!(
+                            "edge ({parent_hash}, {child_hash}): parent height {parent_height} \
+                             is not less than child height {child_height}"
+                        ));
+                    }
+                }
+            }
+        }
+
+        // 4. `parents` is exactly the inverse of `next_hashes` restricted to known parents.
+        for (child, ids) in &self.parents {
+            for id in ids {
+                match self.blocks.get(&id.hash) {
+                    Some((height, _)) if *height == id.height => {}
+                    Some((height, _)) => {
+                        return Err(format!(
+                            "parents[{child}] contains {id:?}, but block {} is at height {height}",
+                            id.hash
+                        ))
+                    }
+                    None => {
+                        return Err(format!(
+                            "parents[{child}] contains {id:?}, but that block is missing"
+                        ))
+                    }
+                }
+                if !self.next_hashes.get(&id.hash).is_some_and(|s| s.contains(child)) {
+                    return Err(format!(
+                        "parents[{child}] contains {id:?}, but next_hashes[{}] doesn't contain {child}",
+                        id.hash
+                    ));
+                }
+            }
+        }
+        for (parent_hash, children) in &self.next_hashes {
+            if let Some((height, _)) = self.blocks.get(parent_hash) {
+                let parent_id = BlockId {
+                    height: *height,
+                    hash: *parent_hash,
+                };
+                for child in children {
+                    if !self.parents.get(child).is_some_and(|s| s.contains(&parent_id)) {
+                        return Err(format!(
+                            "edge ({parent_hash}, {child}) exists, but parents[{child}] doesn't contain {parent_id:?}"
+                        ));
+                    }
+                }
+            }
+        }
+
+        // 5. tip chain sanity: heights strictly decrease to genesis at height 0, and every
+        // checkpoint agrees with `blocks`.
+        let mut prev_height: Option<u32> = None;
+        let mut last = None;
+        for cp in self.tip.iter() {
+            if let Some(prev_height) = prev_height {
+                if cp.height() >= prev_height {
+                    return Err(format!(
+                        "tip chain heights are not strictly decreasing at height {}",
+                        cp.height()
+                    ));
+                }
+            }
+            prev_height = Some(cp.height());
+            if cp.hash() != cp.value().to_blockhash() {
+                return Err(format!(
+                    "tip checkpoint at height {} has hash {} but its value hashes to {}",
+                    cp.height(),
+                    cp.hash(),
+                    cp.value().to_blockhash()
+                ));
+            }
+            if !matches!(self.blocks.get(&cp.hash()), Some((height, _)) if *height == cp.height()) {
+                return Err(format!("tip checkpoint {:?} doesn't match blocks", cp.block_id()));
+            }
+            last = Some(cp);
+        }
+        match last {
+            Some(cp) if cp.height() == 0 && cp.hash() == self.root => {}
+            Some(cp) => {
+                return Err(format!(
+                    "tip chain's genesis is {:?}, expected height 0 hash {}",
+                    cp.block_id(),
+                    self.root
+                ))
+            }
+            None => return Err("tip chain is empty".into()),
+        }
+
+        Ok(())
+    }
+
+    /// Check the longest-chain rule: only valid after [`apply_update`](Self::apply_update) or
+    /// [`from_changeset`](Self::from_changeset), since [`connect_block`](Self::connect_block)
+    /// deliberately leaves the tip alone.
+    #[doc(hidden)]
+    pub fn check_best_tip(&self) -> Result<(), alloc::string::String> {
+        // BFS every block reachable from root via `next_hashes`.
+        let mut visited = HashSet::<BlockHash>::new();
+        let mut queue = vec![self.root];
+        let mut best: Option<BlockId> = None;
+
+        while let Some(hash) = queue.pop() {
+            if !visited.insert(hash) {
+                continue;
+            }
+            if let Some(id) = self.block_id(&hash) {
+                let key = (id.height, core::cmp::Reverse(id.hash));
+                if best.is_none_or(|b| (b.height, core::cmp::Reverse(b.hash)) < key) {
+                    best = Some(id);
+                }
+            }
+            if let Some(children) = self.next_hashes.get(&hash) {
+                queue.extend(children);
+            }
+        }
+
+        let best = best.ok_or_else(|| format!("no blocks reachable from root {}", self.root))?;
+        let tip_id = self.tip.block_id();
+        if tip_id != best {
+            return Err(format!("tip is {tip_id:?}, but the best reachable block is {best:?}"));
+        }
+        Ok(())
+    }
+}
+
 impl<T: Debug + Clone + PartialEq> PartialEq for BlockGraph<T> {
     fn eq(&self, other: &Self) -> bool {
         self.blocks == other.blocks
+            && self.parents == other.parents
             && self.next_hashes == other.next_hashes
             && self.root == other.root
             && self.tip == other.tip
@@ -433,7 +700,19 @@ where
         prev_hash: BlockHash,
     ) -> Result<ChangeSet<T>, ConnectBlockError> {
         if !self.is_connected(height, &value, &prev_hash) {
-            let parent_height = self.blocks.get(&prev_hash).map(|(height, _)| *height);
+            let hash = value.to_blockhash();
+            check_not_second_genesis(self.root, hash, height)?;
+            let existing_height = self.blocks.get(&hash).map(|(h, _)| *h);
+            check_height_unchanged(hash, height, existing_height)?;
+            if existing_height.is_none() {
+                self.check_no_child_height_violation(hash, height)?;
+            }
+            let parent_height = self_parent_height(
+                hash,
+                prev_hash,
+                height,
+                self.blocks.get(&prev_hash).map(|(h, _)| *h),
+            );
             check_parent_height(height, parent_height)?;
             check_prev_blockhash(height, &value, &prev_hash, parent_height)?;
         }
@@ -450,15 +729,27 @@ where
         let mut staged = HashMap::<BlockHash, u32>::new();
 
         for (block_id, value, prev_hash) in items {
+            let hash = value.to_blockhash();
             if !self.is_connected(block_id.height, value, prev_hash) {
+                check_not_second_genesis(self.root, hash, block_id.height)?;
+                let existing_height = staged
+                    .get(&hash)
+                    .copied()
+                    .or_else(|| self.blocks.get(&hash).map(|(h, _)| *h));
+                check_height_unchanged(hash, block_id.height, existing_height)?;
+                if existing_height.is_none() {
+                    self.check_no_child_height_violation(hash, block_id.height)?;
+                }
                 let parent_height = staged
                     .get(prev_hash)
                     .copied()
                     .or_else(|| self.blocks.get(prev_hash).map(|(height, _)| *height));
+                let parent_height =
+                    self_parent_height(hash, *prev_hash, block_id.height, parent_height);
                 check_parent_height(block_id.height, parent_height)?;
                 check_prev_blockhash(block_id.height, value, prev_hash, parent_height)?;
             }
-            staged.insert(value.to_blockhash(), block_id.height);
+            staged.insert(hash, block_id.height);
         }
 
         Ok(())
@@ -619,23 +910,131 @@ where
 pub enum FromChangeSetError {
     /// The changeset contains no block at height 0.
     MissingGenesis,
+    /// More than one distinct block is declared at height 0. A graph has exactly one root, so
+    /// this is ambiguous: canonicalizing could otherwise walk back through a block's `parents`
+    /// into a tree rooted at the block that lost the ambiguity, never reaching the chosen root.
+    MultipleGenesisBlocks {
+        /// The first height-0 block found (by hash order).
+        first: BlockHash,
+        /// A second, distinct height-0 block found in the same changeset.
+        second: BlockHash,
+    },
+    /// An edge's declared parent is not at a strictly lower height than its child, which would
+    /// otherwise allow cyclic or backwards-height data into the graph.
+    InvalidEdgeHeight {
+        /// The edge's declared parent.
+        parent: BlockId,
+        /// The edge's declared child.
+        child: BlockId,
+    },
 }
 
 impl Display for FromChangeSetError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingGenesis => write!(f, "changeset contains no genesis block (height 0)"),
+            Self::MultipleGenesisBlocks { first, second } => write!(
+                f,
+                "changeset declares more than one block at height 0: {first} and {second}"
+            ),
+            Self::InvalidEdgeHeight { parent, child } => write!(
+                f,
+                "edge parent {parent:?} is not at a strictly lower height than child {child:?}"
+            ),
         }
     }
 }
 
 impl core::error::Error for FromChangeSetError {}
 
+/// Check that every edge in `changeset` whose parent and child both appear in
+/// `changeset.blocks` has a parent height strictly less than the child's height.
+///
+/// This is the same rule [`check_parent_height`] enforces on [`connect_block`](BlockGraph::connect_block)
+/// and [`apply_update`](BlockGraph::apply_update), applied to raw changeset data before it's trusted
+/// to build a [`BlockGraph`]. Rejecting these edges up front also rules out cycles (since any
+/// cycle must contain at least one edge whose parent height doesn't decrease).
+fn check_changeset_edge_heights<T>(changeset: &ChangeSet<T>) -> Result<(), FromChangeSetError> {
+    for &(parent_hash, child_hash) in &changeset.edges {
+        let parent_height = changeset.blocks.get(&parent_hash).map(|(height, _)| *height);
+        let child_height = changeset.blocks.get(&child_hash).map(|(height, _)| *height);
+        if let (Some(parent_height), Some(child_height)) = (parent_height, child_height) {
+            if parent_height >= child_height {
+                return Err(FromChangeSetError::InvalidEdgeHeight {
+                    parent: BlockId {
+                        height: parent_height,
+                        hash: parent_hash,
+                    },
+                    child: BlockId {
+                        height: child_height,
+                        hash: child_hash,
+                    },
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The parent of a block must exist at a strictly lower height than the block itself.
 fn check_parent_height(height: u32, parent_height: Option<u32>) -> Result<(), ConnectBlockError> {
     match parent_height {
         Some(parent_height) if parent_height >= height => {
             Err(ConnectBlockError::ParentHeightNotSmaller)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Height 0 is reserved for the graph's single root, established by `from_genesis`. An unknown
+/// parent never blocks a connection (that's how gapped connections work), so without this check
+/// any other hash could also be connected at height 0, creating a second "genesis" that
+/// `canonicalize`'s backward walk and `from_changeset`'s `MultipleGenesisBlocks` check both
+/// assume can't happen.
+fn check_not_second_genesis(
+    root: BlockHash,
+    hash: BlockHash,
+    height: u32,
+) -> Result<(), ConnectBlockError> {
+    if height == 0 && hash != root {
+        return Err(ConnectBlockError::HeightZeroReservedForRoot { hash });
+    }
+    Ok(())
+}
+
+/// A block can't be its own parent. A self-referential `prev_hash` would otherwise slip past
+/// [`check_parent_height`], since the block isn't recorded in `self.blocks` yet at validation
+/// time (so an unknown parent's height looks like `None`, which always passes) — this treats a
+/// self-reference as if the parent were already recorded at `height`, which always fails the
+/// strict inequality.
+fn self_parent_height(
+    hash: BlockHash,
+    prev_hash: BlockHash,
+    height: u32,
+    parent_height: Option<u32>,
+) -> Option<u32> {
+    if prev_hash == hash {
+        Some(height)
+    } else {
+        parent_height
+    }
+}
+
+/// Blocks are monotone/append-only: once a hash is recorded, it must always be connected at the
+/// same height. Without this check, reconnecting an already-known hash (including the root
+/// itself) at a different height silently overwrites its recorded height in place.
+fn check_height_unchanged(
+    hash: BlockHash,
+    height: u32,
+    existing_height: Option<u32>,
+) -> Result<(), ConnectBlockError> {
+    match existing_height {
+        Some(existing_height) if existing_height != height => {
+            Err(ConnectBlockError::HeightConflict {
+                hash,
+                existing_height,
+                new_height: height,
+            })
         }
         _ => Ok(()),
     }
@@ -663,6 +1062,33 @@ pub enum ConnectBlockError {
     ParentHeightNotSmaller,
     /// An adjacent block's declared `prev_blockhash` doesn't match its parent's hash.
     PrevBlockhashMismatch,
+    /// The block's hash is already recorded in the graph at a different height. Blocks are
+    /// monotone/append-only, so a hash's height must never change once recorded.
+    HeightConflict {
+        /// The block's hash.
+        hash: BlockHash,
+        /// The height already recorded for `hash`.
+        existing_height: u32,
+        /// The height this connection attempted to record instead.
+        new_height: u32,
+    },
+    /// This block is already recorded as an already-connected child's parent, but the height
+    /// declared for it here is not strictly less than that child's height.
+    ChildHeightNotGreater {
+        /// The block's hash.
+        hash: BlockHash,
+        /// The height this connection attempted to record.
+        height: u32,
+        /// The already-connected child that declares `hash` as its parent.
+        child_hash: BlockHash,
+        /// The child's recorded height.
+        child_height: u32,
+    },
+    /// Height 0 is reserved for the graph's single root; this hash is not the root.
+    HeightZeroReservedForRoot {
+        /// The block's hash.
+        hash: BlockHash,
+    },
 }
 
 impl Display for ConnectBlockError {
@@ -675,6 +1101,27 @@ impl Display for ConnectBlockError {
             Self::PrevBlockhashMismatch => {
                 write!(f, "adjacent block's prev_blockhash does not match its parent's hash",)
             }
+            Self::HeightConflict {
+                hash,
+                existing_height,
+                new_height,
+            } => write!(
+                f,
+                "block {hash} is already recorded at height {existing_height}, cannot reconnect at height {new_height}",
+            ),
+            Self::ChildHeightNotGreater {
+                hash,
+                height,
+                child_hash,
+                child_height,
+            } => write!(
+                f,
+                "block {hash} at height {height} is not strictly less than its already-connected child {child_hash} at height {child_height}",
+            ),
+            Self::HeightZeroReservedForRoot { hash } => write!(
+                f,
+                "height 0 is reserved for the graph's root; {hash} is not the root",
+            ),
         }
     }
 }
@@ -1489,6 +1936,308 @@ mod test {
     }
 
     #[test]
+    fn connect_block_rejects_reconnecting_root_at_a_different_height() {
+        // Regression test: reconnecting an already-known hash at a
+        // different height silently overwrote its recorded height in `self.blocks`, corrupting
+        // `self.root`'s own invariant (root must always be at height 0) when the hash happened
+        // to be genesis. Blocks are monotone/append-only, so this must be rejected instead.
+        let genesis = genesis_header();
+        let mut graph = BlockGraph::from_genesis(genesis);
+        let before = graph.clone();
+
+        let unrelated_parent = header(BlockHash::all_zeros(), Some(1)).block_hash();
+        assert_eq!(
+            graph.connect_block(65535, genesis, unrelated_parent),
+            Err(ConnectBlockError::HeightConflict {
+                hash: genesis.block_hash(),
+                existing_height: 0,
+                new_height: 65535,
+            }),
+        );
+        assert_eq!(graph, before, "a rejected reconnection must not mutate the graph");
+        assert_eq!(
+            graph.blocks.get(&genesis.block_hash()).map(|(h, _)| *h),
+            Some(0),
+            "root must remain at height 0"
+        );
+    }
+
+    #[test]
+    fn connect_block_rejects_reconnecting_known_hash_at_a_different_height() {
+        let genesis = genesis_header();
+        let mut graph = BlockGraph::from_genesis(genesis);
+
+        let h1 = header(genesis.block_hash(), Some(1));
+        graph.connect_block(1, h1, genesis.block_hash()).unwrap();
+        let before = graph.clone();
+
+        // Same hash (h1), but declared at height 2 this time instead of 1.
+        assert_eq!(
+            graph.connect_block(2, h1, genesis.block_hash()),
+            Err(ConnectBlockError::HeightConflict {
+                hash: h1.block_hash(),
+                existing_height: 1,
+                new_height: 2,
+            }),
+        );
+        assert_eq!(graph, before, "a rejected reconnection must not mutate the graph");
+    }
+
+    #[test]
+    fn apply_update_rejects_same_hash_at_conflicting_heights_in_one_batch() {
+        // A caller can construct a `CheckPoint` chain with the same header value pushed at two
+        // different heights (`push` only validates strictly-increasing height, not hash
+        // uniqueness), so this must be caught during `apply_update` too, not just `connect_block`.
+        let genesis = genesis_header();
+        let mut graph = BlockGraph::from_genesis(genesis);
+
+        let h1 = header(genesis.block_hash(), Some(1));
+        let cp = graph
+            .tip()
+            .push(1, h1)
+            .unwrap()
+            .push(2, h1) // same value as height 1, now claimed at height 2
+            .unwrap();
+
+        let before = graph.clone();
+        assert_eq!(
+            graph.apply_update(cp),
+            Err(ApplyUpdateError::ConnectBlock(ConnectBlockError::HeightConflict {
+                hash: h1.block_hash(),
+                existing_height: 1,
+                new_height: 2,
+            })),
+        );
+        assert_eq!(graph, before, "a failed apply_update must not mutate the graph");
+    }
+
+    #[test]
+    fn connect_block_rejects_self_referential_parent() {
+        // Regression test: a block declaring itself as its own parent
+        // (`prev_hash == value.to_blockhash()`) slipped past `check_parent_height`, since the
+        // block isn't in `self.blocks` yet at validation time, so its own (about-to-exist)
+        // height looked like an unknown parent — which `check_parent_height` always allows.
+        // This created an immediate self-loop cycle via the safe `connect_block` API, not just
+        // corrupt persisted data (see the `from_changeset` cycle-rejection tests above).
+        let genesis = genesis_header();
+        let mut graph = BlockGraph::from_genesis(genesis);
+        let before = graph.clone();
+
+        let h1 = header(genesis.block_hash(), Some(1));
+        assert_eq!(
+            graph.connect_block(1, h1, h1.block_hash()),
+            Err(ConnectBlockError::ParentHeightNotSmaller),
+        );
+        assert_eq!(
+            graph, before,
+            "a rejected self-referential connect must not mutate the graph"
+        );
+    }
+
+    #[test]
+    fn connect_block_rejects_retroactive_child_height_violation() {
+        // Regression test: connecting a block under an as-yet-unknown
+        // parent hash is legal (a gapped/forward reference), but if that parent hash later gets
+        // connected as an actual block, its height must still be strictly less than every
+        // already-connected child that named it as parent. Without this check, the parent could
+        // retroactively be assigned a height at or above its child's, corrupting the
+        // parent/child height invariant everywhere else in the crate relies on.
+        let genesis = genesis_header();
+        let mut graph = BlockGraph::from_genesis(genesis);
+
+        let parent_header = header(BlockHash::all_zeros(), Some(1));
+        let unknown_parent = parent_header.block_hash();
+        let child = header(unknown_parent, Some(2));
+        graph.connect_block(10, child, unknown_parent).unwrap();
+
+        let before = graph.clone();
+        // Now connect `unknown_parent` for real, at a height that isn't less than its
+        // already-recorded child's height (10).
+        assert_eq!(
+            graph.connect_block(10, parent_header, genesis.block_hash()),
+            Err(ConnectBlockError::ChildHeightNotGreater {
+                hash: unknown_parent,
+                height: 10,
+                child_hash: child.block_hash(),
+                child_height: 10,
+            }),
+        );
+        assert_eq!(graph, before, "a rejected connection must not mutate the graph");
+    }
+
+    #[test]
+    fn connect_block_backfills_parents_for_a_retroactively_known_parent() {
+        // Regression test: a child connected under an as-yet-unknown
+        // parent hash (a gapped/forward reference) never had its `parents` entry backfilled once
+        // that parent was later connected for real, leaving `parent()`'s backward walk unable to
+        // find a parent that actually exists. `check_invariants` catches the resulting mismatch
+        // between `next_hashes` and `parents`.
+        let genesis = genesis_header();
+        let mut graph = BlockGraph::from_genesis(genesis);
+
+        let parent_header = header(BlockHash::all_zeros(), Some(1));
+        let parent_hash = parent_header.block_hash();
+        let child = header(parent_hash, Some(2));
+        graph.connect_block(5, child, parent_hash).unwrap();
+
+        // Now connect `parent_hash` for real, at a height that's still valid for the child.
+        graph.connect_block(1, parent_header, genesis.block_hash()).unwrap();
+        graph.check_invariants().unwrap();
+
+        assert_eq!(
+            graph
+                .parents
+                .get(&child.block_hash())
+                .map(|s| s.iter().copied().collect::<Vec<_>>()),
+            Some(vec![BlockId {
+                height: 1,
+                hash: parent_hash
+            }]),
+            "child's parents entry should be backfilled once the parent becomes known"
+        );
+    }
+
+    #[test]
+    fn apply_update_promotes_a_better_chain_left_by_connect_block_even_on_a_no_op_update() {
+        // Regression test: `apply_update` only re-canonicalized starting
+        // from the items *it* connected (`from_hash`); if the update contributed nothing new
+        // (e.g. it just re-affirms the current tip), reconciliation was skipped entirely — even
+        // though an earlier `connect_block` call (which deliberately never moves the tip) can
+        // have already left a strictly better chain sitting in the graph, still unpromoted.
+        let genesis = genesis_header();
+        let mut graph = BlockGraph::from_genesis(genesis);
+
+        let h1 = header(genesis.block_hash(), Some(1));
+        graph.connect_block(1, h1, genesis.block_hash()).unwrap();
+        assert_eq!(
+            graph.tip().hash(),
+            genesis.block_hash(),
+            "connect_block must not move the tip"
+        );
+
+        // A no-op update: just the current tip, contributing no new items.
+        let cp = CheckPoint::new(0, genesis);
+        let changeset = graph.apply_update(cp).unwrap();
+        assert!(changeset.is_empty());
+
+        graph.check_invariants().unwrap();
+        graph.check_best_tip().unwrap();
+        assert_eq!(
+            graph.tip().hash(),
+            h1.block_hash(),
+            "should promote the already-connected h1"
+        );
+    }
+
+    #[test]
+    fn apply_update_reorg_to_a_taller_sibling_does_not_fabricate_ancestry() {
+        // Regression test: reconciliation rebuilt the tip by calling
+        // `insert` on the *current* tip, which splices by height alone. That's only correct
+        // when the new best chain actually descends from the old tip; if it's really a taller
+        // *sibling* branch (its true ancestor is much further back), `insert` would instead
+        // graft it onto the old tip's own lineage, fabricating ancestry that `next_hashes`/
+        // `parents` never recorded — caught here by comparing against the `from_changeset`
+        // roundtrip, which rebuilds `tip` from the graph's real edges rather than by splicing.
+        let genesis = genesis_header();
+        let mut graph = BlockGraph::from_genesis(genesis);
+
+        // A short chain that becomes the tip.
+        let short = header(genesis.block_hash(), Some(1));
+        graph
+            .apply_update(CheckPoint::new(0, genesis).push(1, short).unwrap())
+            .unwrap();
+        assert_eq!(graph.tip().hash(), short.block_hash());
+
+        // A taller, unrelated sibling connected directly under genesis (not under `short`).
+        let tall = header(genesis.block_hash(), Some(2));
+        graph.connect_block(100, tall, genesis.block_hash()).unwrap();
+        assert_eq!(
+            graph.tip().hash(),
+            short.block_hash(),
+            "connect_block must not move the tip"
+        );
+
+        // A no-op update should still discover and correctly promote `tall`.
+        graph.apply_update(CheckPoint::new(0, genesis)).unwrap();
+
+        assert_eq!(graph.tip().hash(), tall.block_hash());
+        assert_eq!(graph.tip().height(), 100);
+        assert_eq!(
+            graph.tip().prev().map(|cp| cp.hash()),
+            Some(genesis.block_hash()),
+            "tall's real parent is genesis directly, not short"
+        );
+        graph.check_invariants().unwrap();
+        graph.check_best_tip().unwrap();
+
+        let recovered = BlockGraph::from_changeset(graph.initial_changeset()).unwrap().unwrap();
+        assert_eq!(
+            recovered, graph,
+            "roundtrip must match: tip must reflect real ancestry"
+        );
+    }
+
+    #[test]
+    fn connect_block_rejects_second_block_at_height_zero() {
+        // Regression test: height 0 is reserved for the graph's single
+        // root, but nothing stopped a *different* hash from also being connected at height 0
+        // under an unknown parent (unknown parents never block a connection, by design, for
+        // gapped connections). That silently created a second "genesis", later rejected only on
+        // a `from_changeset` roundtrip via `MultipleGenesisBlocks` — too late, since the graph
+        // itself was already broken.
+        let genesis = genesis_header();
+        let mut graph = BlockGraph::from_genesis(genesis);
+        let before = graph.clone();
+
+        let other = header(BlockHash::all_zeros(), Some(1));
+        assert_eq!(
+            graph.connect_block(0, other, BlockHash::all_zeros()),
+            Err(ConnectBlockError::HeightZeroReservedForRoot {
+                hash: other.block_hash()
+            }),
+        );
+        assert_eq!(graph, before, "a rejected connection must not mutate the graph");
+    }
+
+    #[test]
+    fn apply_update_finds_best_chain_on_an_unrelated_third_branch() {
+        // Regression test: reconciliation used to search for a "fork
+        // point" only relative to the update's own new items (via a backward walk from the new
+        // hash), so it could miss an entirely unrelated, already-better branch elsewhere in the
+        // graph — e.g. one connected by an earlier, unrelated update. Re-canonicalizing must
+        // always search the whole graph from the root.
+        let genesis = genesis_header();
+        let mut graph = BlockGraph::from_genesis(genesis);
+
+        // Branch A: becomes the tip.
+        let a = header(genesis.block_hash(), Some(1));
+        graph
+            .apply_update(CheckPoint::new(0, genesis).push(1, a).unwrap())
+            .unwrap();
+        assert_eq!(graph.tip().hash(), a.block_hash());
+
+        // Branch B: taller than A, connected directly under genesis (a sibling of A).
+        let b = header(genesis.block_hash(), Some(2));
+        graph.connect_block(500, b, genesis.block_hash()).unwrap();
+        assert_eq!(
+            graph.tip().hash(),
+            a.block_hash(),
+            "connect_block must not move the tip"
+        );
+
+        // Branch C: a small, unrelated update that itself contributes a shorter chain than B.
+        let c = header(a.block_hash(), Some(3));
+        graph.apply_update(CheckPoint::new(1, a).push(2, c).unwrap()).unwrap();
+
+        // Despite C being the most recently touched branch, B (found via a full search from
+        // root) is still the true best chain.
+        assert_eq!(graph.tip().hash(), b.block_hash());
+        assert_eq!(graph.tip().height(), 500);
+        graph.check_invariants().unwrap();
+        graph.check_best_tip().unwrap();
+    }
+
+    #[test]
     fn connect_block_connected_adjacent_ok() {
         let genesis = genesis_header();
         let mut graph = BlockGraph::from_genesis(genesis);
@@ -1578,5 +2327,246 @@ mod test {
 
         let changeset = graph.apply_update_connected(cp).unwrap();
         assert_eq!(changeset.blocks, [(h3.block_hash(), (3u32, h3))].into());
+    }
+
+    // --- `check_invariants` / `check_best_tip` ---
+
+    #[test]
+    fn invariants_hold_for_linear_chain() {
+        let genesis = genesis_header();
+        let mut graph = BlockGraph::from_genesis(genesis);
+
+        let (cp, _headers) = extend_with_headers(graph.tip(), 5, 1);
+        graph.apply_update(cp).unwrap();
+
+        graph.check_invariants().unwrap();
+        graph.check_best_tip().unwrap();
+    }
+
+    #[test]
+    fn invariants_hold_after_fork_reorg() {
+        let genesis = genesis_header();
+        let mut graph = BlockGraph::from_genesis(genesis);
+
+        let h1a = header(genesis.block_hash(), Some(1));
+        let h2a = header(h1a.block_hash(), Some(2));
+        let h1b = header(genesis.block_hash(), Some(101));
+        let h2b = header(h1b.block_hash(), Some(102));
+        let h3b = header(h2b.block_hash(), Some(103));
+
+        graph
+            .apply_update(checkpoint([(0, genesis), (1, h1a), (2, h2a)]))
+            .unwrap();
+        graph.check_invariants().unwrap();
+        graph.check_best_tip().unwrap();
+
+        // Extend the shorter fork past the current best tip, forcing a reorg.
+        graph
+            .apply_update(checkpoint([(0, genesis), (1, h1b), (2, h2b), (3, h3b)]))
+            .unwrap();
+        graph.check_invariants().unwrap();
+        graph.check_best_tip().unwrap();
+        assert_eq!(graph.tip().hash(), h3b.block_hash());
+    }
+
+    #[test]
+    fn invariants_hold_for_gapped_connection() {
+        let genesis = genesis_header();
+        let mut graph = BlockGraph::from_genesis(genesis);
+
+        let h1 = header(genesis.block_hash(), Some(1));
+        let h2 = header(h1.block_hash(), Some(2));
+        let h3 = header(h2.block_hash(), Some(3));
+        let cp = graph.tip().insert(3, h3);
+        graph.apply_update(cp).unwrap();
+        graph.check_invariants().unwrap();
+        graph.check_best_tip().unwrap();
+
+        // Fill the gap; `connect_block` alone must not move the tip.
+        graph.connect_block(1, h1, genesis.block_hash()).unwrap();
+        graph.connect_block(2, h2, h1.block_hash()).unwrap();
+        graph.check_invariants().unwrap();
+        assert_eq!(
+            graph.tip().hash(),
+            h3.block_hash(),
+            "connect_block must not move the tip"
+        );
+    }
+
+    // --- `canonicalize` visited-set regression, and `from_changeset` edge-height validation ---
+    //
+    // `canonicalize`'s tip-discovery BFS previously had no visited-set, so a diamond-shaped DAG
+    // (legitimate: skip-chain edges deliberately give a block more than one recorded parent) was
+    // re-traversed once per incoming path, and a self-referencing/cyclic edge in a `ChangeSet`
+    // sent it into an infinite loop. Adding the visited-set fixed the hang, but a purely cyclic
+    // graph then had no leaf at all, turning the hang into a panic in `canonicalize`. Changeset
+    // edges are now validated for strictly-increasing parent/child height before the graph is
+    // built (`check_changeset_edge_heights`), which rejects cycles outright — the only paths
+    // that could otherwise introduce a cycle, since `connect_block`/`apply_update` already
+    // enforce strictly-increasing parent height on every insertion.
+
+    #[test]
+    fn canonicalize_terminates_on_diamond_dag() {
+        let g: BlockHash = Hash::hash(b"genesis");
+        let h1a: BlockHash = Hash::hash(b"1a");
+        let h1b: BlockHash = Hash::hash(b"1b");
+        let h2: BlockHash = Hash::hash(b"2"); // two parents: h1a and h1b
+        let h3: BlockHash = Hash::hash(b"3"); // sole leaf
+
+        let changeset = ChangeSet {
+            blocks: [
+                (g, (0u32, g)),
+                (h1a, (1u32, h1a)),
+                (h1b, (1u32, h1b)),
+                (h2, (2u32, h2)),
+                (h3, (3u32, h3)),
+            ]
+            .into(),
+            edges: [
+                (BlockHash::all_zeros(), g),
+                (g, h1a),
+                (g, h1b),
+                (h1a, h2),
+                (h1b, h2),
+                (h2, h3),
+            ]
+            .into(),
+        };
+
+        let graph = BlockGraph::from_changeset(changeset).unwrap().unwrap();
+        graph.check_invariants().unwrap();
+        graph.check_best_tip().unwrap();
+        assert_eq!(graph.tip().hash(), h3);
+    }
+
+    #[test]
+    fn from_changeset_rejects_cycle_even_with_an_escape_leaf() {
+        let g: BlockHash = Hash::hash(b"genesis");
+        let h_x: BlockHash = Hash::hash(b"x");
+        let h_y: BlockHash = Hash::hash(b"y"); // hX -> hY -> hX forms a cycle
+        let h_leaf: BlockHash = Hash::hash(b"leaf"); // a real leaf elsewhere in the graph
+
+        let changeset = ChangeSet {
+            blocks: [
+                (g, (0u32, g)),
+                (h_x, (1u32, h_x)),
+                (h_y, (2u32, h_y)),
+                (h_leaf, (1u32, h_leaf)),
+            ]
+            .into(),
+            edges: [
+                (BlockHash::all_zeros(), g),
+                (g, h_x),
+                (h_x, h_y),
+                (h_y, h_x), // cycles back: parent height 2 >= child height 1
+                (g, h_leaf),
+            ]
+            .into(),
+        };
+
+        // The presence of a valid leaf elsewhere must not let the cyclic edge slip through:
+        // every edge is validated, not just the ones the tip-selection BFS happens to reach.
+        assert_eq!(
+            BlockGraph::from_changeset(changeset),
+            Err(FromChangeSetError::InvalidEdgeHeight {
+                parent: BlockId {
+                    height: 2,
+                    hash: h_y
+                },
+                child: BlockId {
+                    height: 1,
+                    hash: h_x
+                },
+            }),
+        );
+    }
+
+    #[test]
+    fn from_changeset_rejects_multiple_genesis_blocks() {
+        // Regression test: with two distinct height-0 blocks, whichever
+        // one isn't picked as the designated root can still end up reachable as some other
+        // block's "best" recorded parent, so `canonicalize`'s backward walk can land on it
+        // instead of the real root, smuggling an extra height-0 entry into the canonical items
+        // and panicking `tip.extend` (which requires strictly-increasing height from the tip's
+        // starting height of 0).
+        let g1: BlockHash = Hash::hash(b"genesis-1");
+        let g2: BlockHash = Hash::hash(b"genesis-2");
+
+        let changeset = ChangeSet {
+            blocks: [(g1, (0u32, g1)), (g2, (0u32, g2))].into(),
+            edges: [(BlockHash::all_zeros(), g1), (BlockHash::all_zeros(), g2)].into(),
+        };
+
+        let (first, second) = if g1 < g2 { (g1, g2) } else { (g2, g1) };
+        assert_eq!(
+            BlockGraph::from_changeset(changeset),
+            Err(FromChangeSetError::MultipleGenesisBlocks { first, second }),
+        );
+    }
+
+    #[test]
+    fn from_changeset_rejects_self_referencing_edge() {
+        // Regression test: an infinite loop (and, before edge-height validation
+        // was added, a follow-on panic in `canonicalize`): a self-referencing edge on genesis.
+        let g: BlockHash = Hash::hash(b"genesis");
+        let changeset = ChangeSet {
+            blocks: [(g, (0u32, g))].into(),
+            edges: [(BlockHash::all_zeros(), g), (g, g)].into(),
+        };
+
+        assert_eq!(
+            BlockGraph::from_changeset(changeset),
+            Err(FromChangeSetError::InvalidEdgeHeight {
+                parent: BlockId { height: 0, hash: g },
+                child: BlockId { height: 0, hash: g },
+            }),
+        );
+    }
+
+    #[test]
+    fn from_changeset_rejects_backwards_height_edge() {
+        let g: BlockHash = Hash::hash(b"genesis");
+        let h1: BlockHash = Hash::hash(b"1");
+        let h2: BlockHash = Hash::hash(b"2");
+
+        // h2 is declared as h1's parent, despite being at a higher height.
+        let changeset = ChangeSet {
+            blocks: [(g, (0u32, g)), (h1, (1u32, h1)), (h2, (2u32, h2))].into(),
+            edges: [(BlockHash::all_zeros(), g), (g, h2), (h2, h1)].into(),
+        };
+
+        assert_eq!(
+            BlockGraph::from_changeset(changeset),
+            Err(FromChangeSetError::InvalidEdgeHeight {
+                parent: BlockId {
+                    height: 2,
+                    hash: h2
+                },
+                child: BlockId {
+                    height: 1,
+                    hash: h1
+                },
+            }),
+        );
+    }
+
+    #[test]
+    fn from_changeset_drops_edges_with_unknown_child() {
+        let g: BlockHash = Hash::hash(b"genesis");
+        let unknown: BlockHash = Hash::hash(b"unknown"); // never appears in `blocks`
+
+        // Dangling edges whose child has no block data describe no real relationship; they must
+        // be dropped from both `next_hashes` and `parents` rather than left dangling, regardless
+        // of whether the declared parent (here, both an unknown hash and genesis, a known one)
+        // has block data of its own.
+        let changeset = ChangeSet {
+            blocks: [(g, (0u32, g))].into(),
+            edges: [(BlockHash::all_zeros(), g), (unknown, unknown), (g, unknown)].into(),
+        };
+
+        let graph = BlockGraph::from_changeset(changeset).unwrap().unwrap();
+        graph.check_invariants().unwrap();
+        graph.check_best_tip().unwrap();
+        assert_eq!(graph.tip().hash(), g);
     }
 }
