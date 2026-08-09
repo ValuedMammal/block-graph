@@ -25,7 +25,7 @@ check:
 test-name name="":
     cargo test -p block_graph --no-fail-fast --all-features --lib -- block_graph::test::{{name}} --exact --show-output
 
-# Run block-graph unit tests
+# Run all unit tests
 test:
     cargo test -p block_graph --no-fail-fast --all-features --lib --
 
