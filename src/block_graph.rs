@@ -241,13 +241,13 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
     /// Find the best parent [`BlockId`] of the given `hash` if it exists in `self.parents`.
     ///
     /// The "best" parent is the one with the highest order [`BlockId`].
-    ///
-    /// Open design question: it's not established that "highest order" (by `(height, hash)`) is
-    /// always the *correct* choice for reconstructing actual ancestry when a block has more than
-    /// one recorded parent, versus e.g. "whichever parent was most recently recorded". A block
-    /// with two legitimate, same-height parents at a non-root height isn't currently caught by
-    /// any validation, so this could in principle pick the "wrong" one without violating
-    /// `check_invariants`/`check_best_tip`.
+    //
+    // Open design question: it's not established that "highest order" (by `(height, hash)`) is
+    // always the *correct* choice for reconstructing actual ancestry when a block has more than
+    // one recorded parent, versus e.g. "whichever parent was most recently recorded". A block
+    // with two legitimate, same-height parents at a non-root height isn't currently caught by
+    // any validation, so this could in principle pick the "wrong" one without violating
+    // `check_invariants`/`check_best_tip`.
     fn parent(&self, hash: &BlockHash) -> Option<BlockId> {
         self.parents.get(hash)?.iter().last().copied()
     }
@@ -369,8 +369,7 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
 
         // `hash` may already be recorded as some other block's declared parent from an earlier
         // gapped connection (made before `hash` itself was known). Now that `hash` has a
-        // committed height, backfill `parents` for each of those children — otherwise they'd be
-        // stuck believing they have no known parent, even though one now exists.
+        // committed height, backfill `parents` for each of those children.
         if is_new_hash {
             if let Some(children) = self.next_hashes.get(&hash).cloned() {
                 let this_id = BlockId { height, hash };
@@ -1021,8 +1020,10 @@ fn self_parent_height(
 }
 
 /// Blocks are monotone/append-only: once a hash is recorded, it must always be connected at the
-/// same height. Without this check, reconnecting an already-known hash (including the root
-/// itself) at a different height silently overwrites its recorded height in place.
+/// same height.
+///
+/// Without this, reconnecting an already-known hash at a different height would overwrite its
+/// recorded height in place.
 fn check_height_unchanged(
     hash: BlockHash,
     height: u32,
@@ -2017,8 +2018,7 @@ mod test {
         // (`prev_hash == value.to_blockhash()`) slipped past `check_parent_height`, since the
         // block isn't in `self.blocks` yet at validation time, so its own (about-to-exist)
         // height looked like an unknown parent — which `check_parent_height` always allows.
-        // This created an immediate self-loop cycle via the safe `connect_block` API, not just
-        // corrupt persisted data (see the `from_changeset` cycle-rejection tests above).
+        // This created an immediate self-loop cycle via the safe `connect_block` API.
         let genesis = genesis_header();
         let mut graph = BlockGraph::from_genesis(genesis);
         let before = graph.clone();
@@ -2183,7 +2183,7 @@ mod test {
         // root, but nothing stopped a *different* hash from also being connected at height 0
         // under an unknown parent (unknown parents never block a connection, by design, for
         // gapped connections). That silently created a second "genesis", later rejected only on
-        // a `from_changeset` roundtrip via `MultipleGenesisBlocks` — too late, since the graph
+        // a `from_changeset` roundtrip via `MultipleGenesisBlocks`, i.e. too late, since the graph
         // itself was already broken.
         let genesis = genesis_header();
         let mut graph = BlockGraph::from_genesis(genesis);
