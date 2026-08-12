@@ -159,15 +159,6 @@ impl<T: Block + PartialEq + Debug + Clone> BlockGraph<T> {
             }
         })?;
 
-        // TODO(@valuedmammal): Can this call out to "check-invariants" ?
-        debug_assert!(
-            graph
-                .tip
-                .get(0)
-                .is_some_and(|cp| cp.value().to_blockhash() == graph.root),
-            "failed to canonicalize blockgraph"
-        );
-
         Ok(Some(graph))
     }
 
