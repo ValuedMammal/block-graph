@@ -4,7 +4,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::RangeBounds;
 
-use bitcoin::{block::Header, BlockHash};
+use bitcoin::{block::Header, hashes::Hash, BlockHash};
 
 /// Block ID
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -15,11 +15,26 @@ pub struct BlockId {
     pub hash: BlockHash,
 }
 
-impl From<(u32, BlockHash)> for BlockId {
-    fn from(tup: (u32, BlockHash)) -> Self {
+impl Default for BlockId {
+    fn default() -> Self {
         Self {
-            height: tup.0,
-            hash: tup.1,
+            height: Default::default(),
+            hash: BlockHash::all_zeros(),
+        }
+    }
+}
+
+impl From<(u32, BlockHash)> for BlockId {
+    fn from((height, hash): (u32, BlockHash)) -> Self {
+        Self { height, hash }
+    }
+}
+
+impl From<(&u32, &BlockHash)> for BlockId {
+    fn from((height, hash): (&u32, &BlockHash)) -> Self {
+        Self {
+            height: *height,
+            hash: *hash,
         }
     }
 }
