@@ -44,6 +44,10 @@ fuzz-build:
 fuzz target="from_changeset" secs="30":
     cd fuzz && cargo +nightly fuzz run {{target}} -- -max_total_time={{secs}} -max_len=4096 -rss_limit_mb=4096 -timeout=10
 
+# Coverage-minimize a target's local corpus
+fuzz-cmin target="from_changeset":
+    cd fuzz && cargo +nightly fuzz cmin {{target}} -- -rss_limit_mb=4096 -timeout=10
+
 # Lint the `fuzzing` cfg path of the main crate
 check-fuzzing:
     RUSTFLAGS="--cfg fuzzing" cargo clippy --all-targets --all-features -- -Dwarnings

@@ -26,6 +26,20 @@ Every assertion in these targets carries a `Debug`-formatted scenario in its pan
 `block_graph_fuzz::assert_ok`), so an artifact tells you *which* invariant broke and *what*
 operation sequence caused it without re-running anything.
 
+## Corpus and CI
+
+`corpus/<target>/` is **not** committed — it's a build product, and a corpus large enough to be worth
+keeping is too large to want in a library's git history. `cargo fuzz run` grows it locally as it
+finds new coverage; `just fuzz-cmin <target>` prunes it back to one input per coverage class.
+
+[`.github/workflows/fuzz.yml`](../.github/workflows/fuzz.yml) builds every target on each PR and
+runs each for 60s. The real fuzzing happens in the nightly scheduled run (30 minutes per target),
+which is also the only run that *writes* the corpus cache: it `cmin`s the corpus and saves it under
+a key scoped to the default branch, so it compounds night over night and PR runs start warm instead
+of rediscovering "forks exist" every time. PR runs restore that cache but never save, so a PR can't
+poison the shared corpus. Crash artifacts are uploaded on failure. The nightly toolchain is pinned
+in that workflow's `env`, so bumping it is a deliberate, reviewable change.
+
 ## How the fuzzers see the graph
 
 **We never feed raw bytes as block data.** The graph is keyed by `BlockHash`; a random 32-byte
