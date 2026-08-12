@@ -17,7 +17,7 @@ use core::ops::RangeBounds;
 
 use bitcoin::{hashes::Hash, BlockHash};
 
-use crate::checkpoint::{BlockId, CheckPoint, HasPrevBlockhash, ToBlockHash};
+use crate::checkpoint::{Block, BlockId, CheckPoint};
 use crate::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Block graph.
@@ -38,7 +38,7 @@ pub struct BlockGraph<T> {
     tip: CheckPoint<T>,
 }
 
-impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
+impl<T: Block + PartialEq + Debug + Clone> BlockGraph<T> {
     /// From genesis `value`.
     pub fn from_genesis(value: T) -> Self {
         let genesis_height = 0;
@@ -110,9 +110,10 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
     ///
     /// Returns [`FromChangeSetError::MissingGenesis`] if no block at height 0 exists in the
     /// changeset, [`FromChangeSetError::MultipleGenesisBlocks`] if more than one distinct block
-    /// is declared at height 0, or [`FromChangeSetError::InvalidEdgeHeight`] if an edge's
+    /// is declared at height 0, [`FromChangeSetError::InvalidEdgeHeight`] if an edge's
     /// declared parent (when present in `changeset.blocks`) is not at a strictly lower height
-    /// than its child.
+    /// than its child, or [`FromChangeSetError::InconsistentPrevBlockhash`] if an adjacent pair
+    /// in the reconstructed chain declares a `prev_blockhash` that doesn't match its parent.
     pub fn from_changeset(changeset: ChangeSet<T>) -> Result<Option<Self>, FromChangeSetError> {
         if changeset.blocks.is_empty() {
             return Ok(None);
@@ -152,7 +153,11 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
         }
 
         let items = graph.canonicalize(graph.root);
-        graph.tip = graph.tip.extend(items).expect("tip height must only increase");
+        graph.tip = graph.tip.extend(items).map_err(|err| {
+            FromChangeSetError::InconsistentPrevBlockhash {
+                hash: err.value.to_blockhash(),
+            }
+        })?;
 
         // TODO(@valuedmammal): Can this call out to "check-invariants" ?
         debug_assert!(
@@ -273,6 +278,11 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
     ///
     /// - If the parent with `prev_hash` doesn't exist at a strictly lower height than
     ///   the `height` being connected. The graph is left unchanged in that case.
+    /// - If `height` is directly adjacent to the parent's height and `value` declares a
+    ///   `prev_blockhash` that doesn't match `prev_hash`. Gapped connections are unaffected,
+    ///   since intermediate blocks are legitimately absent from the graph; likewise, values
+    ///   that don't declare a `prev_blockhash` (see [`Block`]) are never rejected
+    ///   on this basis.
     pub fn connect_block(
         &mut self,
         height: u32,
@@ -287,11 +297,14 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
             if existing_height.is_none() {
                 self.check_no_child_height_violation(hash, height)?;
             }
-            let parent_height = self.blocks.get(&prev_hash).map(|(h, _)| *h);
-            check_parent_height(
+            let parent_height = self_parent_height(
+                hash,
+                prev_hash,
                 height,
-                self_parent_height(hash, prev_hash, height, parent_height),
-            )?;
+                self.blocks.get(&prev_hash).map(|(h, _)| *h),
+            );
+            check_parent_height(height, parent_height)?;
+            check_prev_blockhash(height, &value, &prev_hash, parent_height)?;
         }
 
         Ok(self.connect_block_unchecked(height, value, prev_hash))
@@ -386,7 +399,8 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
     }
 
     /// Validate that every item of `items` can be connected, assuming the items are
-    /// connected in the given order.
+    /// connected in the given order. Adjacent items are additionally validated against
+    /// their declared `prev_blockhash` whenever the value provides one.
     fn validate_connections(
         &self,
         items: &[(BlockId, T, BlockHash)],
@@ -413,10 +427,10 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
                     .get(prev_hash)
                     .copied()
                     .or_else(|| self.blocks.get(prev_hash).map(|(height, _)| *height));
-                check_parent_height(
-                    block_id.height,
-                    self_parent_height(hash, *prev_hash, block_id.height, parent_height),
-                )?;
+                let parent_height =
+                    self_parent_height(hash, *prev_hash, block_id.height, parent_height);
+                check_parent_height(block_id.height, parent_height)?;
+                check_prev_blockhash(block_id.height, value, prev_hash, parent_height)?;
             }
             staged.insert(hash, block_id.height);
         }
@@ -427,7 +441,9 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
     /// Applies a [`CheckPoint`] update to the [`BlockGraph`] and returns the resulting [`ChangeSet`].
     ///
     /// If the update results in a new best tip, or if a fork is detected, the BlockGraph reconciles
-    /// the single canonical chain tip internally.
+    /// the single canonical chain tip internally. Adjacent blocks are validated against their
+    /// declared `prev_blockhash` whenever `T` provides one; gapped connections are unaffected,
+    /// since intermediate blocks are legitimately absent from the graph.
     ///
     /// Errors if a checkpoint item doesn't declare its parent, indicating no common ancestor
     /// was found between `checkpoint` and this `BlockGraph`.
@@ -437,20 +453,6 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
     pub fn apply_update(
         &mut self,
         checkpoint: CheckPoint<T>,
-    ) -> Result<ChangeSet<T>, ApplyUpdateError>
-    where
-        T: ToBlockHash + Clone,
-    {
-        self.apply_update_inner(checkpoint, Self::validate_connections)
-    }
-
-    /// Shared plumbing for [`apply_update`](Self::apply_update) and
-    /// [`apply_update_connected`](Self::apply_update_connected); `validate` is the only part
-    /// that differs between the two.
-    fn apply_update_inner(
-        &mut self,
-        checkpoint: CheckPoint<T>,
-        validate: impl FnOnce(&Self, &[(BlockId, T, BlockHash)]) -> Result<(), ConnectBlockError>,
     ) -> Result<ChangeSet<T>, ApplyUpdateError> {
         let mut items = self.merge_chains(checkpoint);
         items.reverse();
@@ -464,7 +466,7 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        validate(self, &items)?;
+        self.validate_connections(&items)?;
 
         // Connect each item in ascending height order.
         let mut changeset = ChangeSet::default();
@@ -512,7 +514,7 @@ impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
 
 /// Invariant checks used by tests.
 #[cfg(test)]
-impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
+impl<T: Block + PartialEq + Debug + Clone> BlockGraph<T> {
     /// Check structural invariants that must hold at all times.
     #[doc(hidden)]
     pub fn check_invariants(&self) -> Result<(), alloc::string::String> {
@@ -684,88 +686,7 @@ impl<T: Debug + Clone + PartialEq> PartialEq for BlockGraph<T> {
     }
 }
 
-impl<T> BlockGraph<T>
-where
-    T: ToBlockHash + HasPrevBlockhash + PartialEq + Debug + Clone,
-{
-    /// Connects a value of `T` at `height` to `prev_hash`, like [`connect_block`](Self::connect_block),
-    /// but additionally validates `prev_blockhash` linkage for adjacent blocks (`height` immediately
-    /// after the parent's height). Gapped connections are unaffected, since intermediate blocks are
-    /// legitimately absent from the graph.
-    pub fn connect_block_connected(
-        &mut self,
-        height: u32,
-        value: T,
-        prev_hash: BlockHash,
-    ) -> Result<ChangeSet<T>, ConnectBlockError> {
-        if !self.is_connected(height, &value, &prev_hash) {
-            let hash = value.to_blockhash();
-            check_not_second_genesis(self.root, hash, height)?;
-            let existing_height = self.blocks.get(&hash).map(|(h, _)| *h);
-            check_height_unchanged(hash, height, existing_height)?;
-            if existing_height.is_none() {
-                self.check_no_child_height_violation(hash, height)?;
-            }
-            let parent_height = self_parent_height(
-                hash,
-                prev_hash,
-                height,
-                self.blocks.get(&prev_hash).map(|(h, _)| *h),
-            );
-            check_parent_height(height, parent_height)?;
-            check_prev_blockhash(height, &value, &prev_hash, parent_height)?;
-        }
-
-        Ok(self.connect_block_unchecked(height, value, prev_hash))
-    }
-
-    /// Like [`validate_connections`](Self::validate_connections), but additionally validates
-    /// `prev_blockhash` linkage for adjacent blocks.
-    fn validate_connections_connected(
-        &self,
-        items: &[(BlockId, T, BlockHash)],
-    ) -> Result<(), ConnectBlockError> {
-        let mut staged = HashMap::<BlockHash, u32>::new();
-
-        for (block_id, value, prev_hash) in items {
-            let hash = value.to_blockhash();
-            if !self.is_connected(block_id.height, value, prev_hash) {
-                check_not_second_genesis(self.root, hash, block_id.height)?;
-                let existing_height = staged
-                    .get(&hash)
-                    .copied()
-                    .or_else(|| self.blocks.get(&hash).map(|(h, _)| *h));
-                check_height_unchanged(hash, block_id.height, existing_height)?;
-                if existing_height.is_none() {
-                    self.check_no_child_height_violation(hash, block_id.height)?;
-                }
-                let parent_height = staged
-                    .get(prev_hash)
-                    .copied()
-                    .or_else(|| self.blocks.get(prev_hash).map(|(height, _)| *height));
-                let parent_height =
-                    self_parent_height(hash, *prev_hash, block_id.height, parent_height);
-                check_parent_height(block_id.height, parent_height)?;
-                check_prev_blockhash(block_id.height, value, prev_hash, parent_height)?;
-            }
-            staged.insert(hash, block_id.height);
-        }
-
-        Ok(())
-    }
-
-    /// Like [`apply_update`](Self::apply_update), but additionally validates `prev_blockhash`
-    /// linkage between adjacent blocks, erroring on invalid chains. Gapped connections are
-    /// unaffected, since intermediate blocks are legitimately absent from the graph.
-    pub fn apply_update_connected(
-        &mut self,
-        checkpoint: CheckPoint<T>,
-    ) -> Result<ChangeSet<T>, ApplyUpdateError> {
-        self.apply_update_inner(checkpoint, Self::validate_connections_connected)
-    }
-}
-
-impl<T: ToBlockHash + PartialEq + Debug + Clone> BlockGraph<T> {
+impl<T: Block + PartialEq + Debug + Clone> BlockGraph<T> {
     /// Get chain tip
     pub fn get_chain_tip(&self) -> BlockId {
         self.tip().block_id()
@@ -835,7 +756,7 @@ impl<T> ChangeSet<T> {
 
 impl<T> BlockGraph<T>
 where
-    T: ToBlockHash + Debug + Clone,
+    T: Block + Debug + Clone,
 {
     /// This method iterates self and update in tandem backwards from the tip,
     /// and returns the new "items to connect".
@@ -926,6 +847,15 @@ pub enum FromChangeSetError {
         /// The edge's declared child.
         child: BlockId,
     },
+    /// An adjacent pair of blocks in the reconstructed canonical chain declares a
+    /// `prev_blockhash` (see [`Block`]) that doesn't match its recorded parent. Unlike
+    /// [`connect_block`](BlockGraph::connect_block)/[`apply_update`](BlockGraph::apply_update),
+    /// `from_changeset` populates the graph directly from possibly-adversarial data, so this
+    /// inconsistency isn't caught until the tip chain is rebuilt.
+    InconsistentPrevBlockhash {
+        /// The block whose declared `prev_blockhash` doesn't match its recorded parent.
+        hash: BlockHash,
+    },
 }
 
 impl Display for FromChangeSetError {
@@ -939,6 +869,10 @@ impl Display for FromChangeSetError {
             Self::InvalidEdgeHeight { parent, child } => write!(
                 f,
                 "edge parent {parent:?} is not at a strictly lower height than child {child:?}"
+            ),
+            Self::InconsistentPrevBlockhash { hash } => write!(
+                f,
+                "block {hash} declares a prev_blockhash that doesn't match its recorded parent"
             ),
         }
     }
@@ -1041,16 +975,18 @@ fn check_height_unchanged(
     }
 }
 
-/// For adjacent blocks (`height == parent_height + 1`), `value`'s declared `prev_blockhash` must
-/// match `prev_hash`. Gapped connections skip this check, since intermediate blocks are
-/// legitimately absent from the graph.
-fn check_prev_blockhash<T: HasPrevBlockhash>(
+/// For adjacent blocks (`height == parent_height + 1`), `value`'s declared `prev_blockhash` (if
+/// any) must match `prev_hash`. Gapped connections, and values that don't declare a
+/// `prev_blockhash`, skip this check.
+fn check_prev_blockhash<T: Block>(
     height: u32,
     value: &T,
     prev_hash: &BlockHash,
     parent_height: Option<u32>,
 ) -> Result<(), ConnectBlockError> {
-    if parent_height.map(|h| h + 1) == Some(height) && value.prev_blockhash() != *prev_hash {
+    if parent_height.map(|h| h + 1) == Some(height)
+        && value.prev_blockhash().is_some_and(|hash| hash != *prev_hash)
+    {
         return Err(ConnectBlockError::PrevBlockhashMismatch);
     }
     Ok(())
@@ -1169,7 +1105,7 @@ mod test {
 
     fn checkpoint<T>(blocks: impl IntoIterator<Item = (u32, T)>) -> CheckPoint<T>
     where
-        T: ToBlockHash + Clone + Debug,
+        T: Block + Clone + Debug,
     {
         CheckPoint::from_entries(blocks).expect("failed to create CheckPoint")
     }
@@ -1987,8 +1923,9 @@ mod test {
     #[test]
     fn apply_update_rejects_same_hash_at_conflicting_heights_in_one_batch() {
         // A caller can construct a `CheckPoint` chain with the same header value pushed at two
-        // different heights (`push` only validates strictly-increasing height, not hash
-        // uniqueness), so this must be caught during `apply_update` too, not just `connect_block`.
+        // different heights, provided the second push is a gap (`push` only validates adjacent
+        // links, not hash uniqueness across the whole chain), so this must be caught during
+        // `apply_update` too, not just `connect_block`.
         let genesis = genesis_header();
         let mut graph = BlockGraph::from_genesis(genesis);
 
@@ -1997,7 +1934,7 @@ mod test {
             .tip()
             .push(1, h1)
             .unwrap()
-            .push(2, h1) // same value as height 1, now claimed at height 2
+            .push(3, h1) // same value as height 1, now claimed at height 3 (a gap)
             .unwrap();
 
         let before = graph.clone();
@@ -2006,7 +1943,7 @@ mod test {
             Err(ApplyUpdateError::ConnectBlock(ConnectBlockError::HeightConflict {
                 hash: h1.block_hash(),
                 existing_height: 1,
-                new_height: 2,
+                new_height: 3,
             })),
         );
         assert_eq!(graph, before, "a failed apply_update must not mutate the graph");
@@ -2075,7 +2012,9 @@ mod test {
         let genesis = genesis_header();
         let mut graph = BlockGraph::from_genesis(genesis);
 
-        let parent_header = header(BlockHash::all_zeros(), Some(1));
+        // `parent_header` genuinely extends genesis, so connecting it adjacent to genesis below
+        // passes prev_blockhash validation; only the forward-referenced `child` connection is a gap.
+        let parent_header = header(genesis.block_hash(), Some(1));
         let parent_hash = parent_header.block_hash();
         let child = header(parent_hash, Some(2));
         graph.connect_block(5, child, parent_hash).unwrap();
@@ -2238,17 +2177,17 @@ mod test {
     }
 
     #[test]
-    fn connect_block_connected_adjacent_ok() {
+    fn connect_block_validates_adjacent_ok() {
         let genesis = genesis_header();
         let mut graph = BlockGraph::from_genesis(genesis);
 
         let h1 = header(genesis.block_hash(), Some(1));
-        let cs = graph.connect_block_connected(1, h1, genesis.block_hash()).unwrap();
+        let cs = graph.connect_block(1, h1, genesis.block_hash()).unwrap();
         assert_eq!(cs.blocks, [(h1.block_hash(), (1u32, h1))].into());
     }
 
     #[test]
-    fn connect_block_connected_adjacent_mismatch_errors() {
+    fn connect_block_rejects_adjacent_prev_blockhash_mismatch() {
         let genesis = genesis_header();
         let mut graph = BlockGraph::from_genesis(genesis);
 
@@ -2258,14 +2197,14 @@ mod test {
 
         let before = graph.clone();
         assert_eq!(
-            graph.connect_block_connected(1, h1, genesis.block_hash()),
+            graph.connect_block(1, h1, genesis.block_hash()),
             Err(ConnectBlockError::PrevBlockhashMismatch),
         );
         assert_eq!(graph, before, "a failed connection must not mutate the graph");
     }
 
     #[test]
-    fn connect_block_connected_gap_skips_check() {
+    fn connect_block_gap_skips_prev_blockhash_check() {
         let genesis = genesis_header();
         let mut graph = BlockGraph::from_genesis(genesis);
 
@@ -2274,58 +2213,65 @@ mod test {
         let unrelated = header(BlockHash::all_zeros(), Some(0)).block_hash();
         let h3 = header(unrelated, Some(3));
 
-        let cs = graph.connect_block_connected(3, h3, genesis.block_hash()).unwrap();
+        let cs = graph.connect_block(3, h3, genesis.block_hash()).unwrap();
         assert_eq!(cs.blocks, [(h3.block_hash(), (3u32, h3))].into());
     }
 
     #[test]
-    fn apply_update_connected_adjacent_ok() {
+    fn connect_block_skips_prev_blockhash_check_for_unvalidatable_type() {
+        // `BlockHash` never declares a `prev_blockhash` (`Block::prev_blockhash` returns `None`),
+        // so an adjacent connection is accepted even when it couldn't possibly be verified.
+        let genesis: BlockHash = Hash::hash(b"genesis");
+        let mut graph = BlockGraph::from_genesis(genesis);
+
+        let h1: BlockHash = Hash::hash(b"1");
+        let cs = graph.connect_block(1, h1, genesis).unwrap();
+        assert_eq!(cs.blocks, [(h1, (1u32, h1))].into());
+    }
+
+    #[test]
+    fn apply_update_validates_adjacent_ok() {
         let genesis = genesis_header();
         let mut graph = BlockGraph::from_genesis(genesis);
 
         let (cp, _headers) = extend_with_headers(graph.tip(), 3, 1);
-        let changeset = graph.apply_update_connected(cp).unwrap();
+        let changeset = graph.apply_update(cp).unwrap();
         assert_eq!(changeset.blocks.len(), 3);
         assert_eq!(graph.tip().height(), 3);
     }
 
     #[test]
-    fn apply_update_connected_rejects_broken_link() {
+    fn apply_update_input_cannot_carry_a_broken_prev_blockhash_link() {
+        // `CheckPoint::push`/`insert` now validate `prev_blockhash` automatically whenever a
+        // value declares one (see `checkpoint::Block`), so a `CheckPoint<Header>` chain can no
+        // longer be built with a broken adjacent link in the first place — there's nothing left
+        // for `apply_update`'s own `check_prev_blockhash` to catch that wasn't already rejected
+        // at construction time. `connect_block`'s check remains reachable, since it takes a raw
+        // `prev_hash` directly rather than a validated `CheckPoint`.
         let genesis = genesis_header();
-        let mut graph = BlockGraph::from_genesis(genesis);
-
-        // Build a checkpoint chain via plain `push`, which doesn't validate `prev_blockhash`.
-        // h2 claims to extend h1, but its `prev_blockhash` doesn't actually match.
         let h1 = header(genesis.block_hash(), Some(1));
         let broken_h2 = header(BlockHash::all_zeros(), Some(2));
-        let cp = graph.tip().push(1, h1).unwrap().push(2, broken_h2).unwrap();
 
-        let before = graph.clone();
-        assert_eq!(
-            graph.apply_update_connected(cp.clone()),
-            Err(ApplyUpdateError::ConnectBlock(
-                ConnectBlockError::PrevBlockhashMismatch
-            )),
-        );
-        assert_eq!(graph, before, "a failed connected update must not mutate the graph");
-
-        // The same checkpoint is accepted by the unvalidated `apply_update`.
-        graph.apply_update(cp).unwrap();
-        assert_eq!(graph.tip().height(), 2);
+        let err = CheckPoint::new(0, genesis)
+            .push(1, h1)
+            .unwrap()
+            .push(2, broken_h2)
+            .unwrap_err();
+        assert_eq!(err.value, broken_h2);
     }
 
     #[test]
-    fn apply_update_connected_allows_gap() {
+    fn apply_update_allows_gap_without_prev_blockhash_check() {
         let genesis = genesis_header();
         let mut graph = BlockGraph::from_genesis(genesis);
 
         // Height 3 is a gapped connection to genesis (heights 1, 2 are absent), so
-        // `apply_update_connected` doesn't require `h3.prev_blockhash()` to match genesis.
+        // `apply_update` doesn't require `h3.prev_blockhash()` to match genesis.
         let unrelated = header(BlockHash::all_zeros(), Some(0)).block_hash();
         let h3 = header(unrelated, Some(3));
         let cp = graph.tip().insert(3, h3);
 
-        let changeset = graph.apply_update_connected(cp).unwrap();
+        let changeset = graph.apply_update(cp).unwrap();
         assert_eq!(changeset.blocks, [(h3.block_hash(), (3u32, h3))].into());
     }
 

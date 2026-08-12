@@ -4,7 +4,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::RangeBounds;
 
-use bitcoin::BlockHash;
+use bitcoin::{block::Header, BlockHash};
 
 /// Block ID
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -24,39 +24,41 @@ impl From<(u32, BlockHash)> for BlockId {
     }
 }
 
-/// Implemented by types that can provide a [`BlockHash`] identifying a block.
-pub trait ToBlockHash {
+/// Implemented by types that can identify a block, optionally declaring the hash of their
+/// predecessor.
+///
+/// `prev_blockhash` returns `None` for types that carry no linkage information (e.g. a bare
+/// [`BlockHash`]); in that case adjacency validation in [`CheckPoint::push`] and
+/// [`CheckPoint::insert`] is skipped.
+pub trait Block {
     /// To block hash
     fn to_blockhash(&self) -> BlockHash;
+
+    /// Prev block hash, if known.
+    fn prev_blockhash(&self) -> Option<BlockHash>;
 }
 
-impl ToBlockHash for BlockHash {
+impl Block for BlockHash {
     fn to_blockhash(&self) -> BlockHash {
         *self
     }
+
+    fn prev_blockhash(&self) -> Option<BlockHash> {
+        None
+    }
 }
 
-impl ToBlockHash for bitcoin::block::Header {
+impl Block for Header {
     fn to_blockhash(&self) -> BlockHash {
         self.block_hash()
     }
-}
 
-/// Implemented by types that carry the hash of their predecessor block.
-///
-/// Used by [`CheckPoint::push_connected`] to validate chain connectivity.
-pub trait HasPrevBlockhash {
-    /// Prev block hash
-    fn prev_blockhash(&self) -> BlockHash;
-}
-
-impl HasPrevBlockhash for bitcoin::block::Header {
-    fn prev_blockhash(&self) -> BlockHash {
-        self.prev_blockhash
+    fn prev_blockhash(&self) -> Option<BlockHash> {
+        Some(self.prev_blockhash)
     }
 }
 
-/// Error returned by [`CheckPoint::push_connected`].
+/// Error returned by [`CheckPoint::push`] and [`CheckPoint::extend`].
 ///
 /// Carries both the rejected value and the checkpoint that was the tip at the
 /// time of the failed push, so callers can inspect or retry.
@@ -116,7 +118,7 @@ impl<T> PartialEq for CheckPoint<T> {
     }
 }
 
-impl<T: ToBlockHash> CheckPoint<T> {
+impl<T: Block> CheckPoint<T> {
     /// Create a genesis checkpoint.
     pub fn new(height: u32, value: T) -> Self {
         let hash = value.to_blockhash();
@@ -136,16 +138,36 @@ impl<T: ToBlockHash> CheckPoint<T> {
         let mut iter = entries.into_iter();
         let (height, value) = iter.next().ok_or(None)?;
         let cp = Self::new(height, value);
-        cp.extend(iter).map_err(Some)
+        cp.extend(iter).map_err(|err| Some(err.checkpoint))
     }
 
-    /// Push a new block onto the tip of the chain.
+    /// Push a new block onto the tip of the chain, with `prev_blockhash` validation whenever
+    /// `value` declares one.
     ///
-    /// Returns `Err(self)` if `height` is not strictly greater than the current tip.
+    /// Returns `Err(ConnectError)` in two cases:
+    /// - `height <= self.height()` — the height is not strictly greater than the current tip
+    /// - `height == self.height() + 1 && value.prev_blockhash() == Some(hash) && hash != self.hash()`
+    ///   — the block is directly adjacent, declares a predecessor, and it doesn't match
+    ///
+    /// Sparse pushes (gap > 1) are allowed without a `prev_blockhash` check, since
+    /// intermediate blocks are simply absent from the checkpoint chain. Likewise, a value that
+    /// doesn't declare a `prev_blockhash` (returns `None`) is never rejected on that basis.
     /// Skip pointers are computed automatically.
-    pub fn push(self, height: u32, value: T) -> Result<Self, Self> {
+    pub fn push(self, height: u32, value: T) -> Result<Self, ConnectError<T>> {
+        // Height must always be strictly greater.
         if self.height() >= height {
-            return Err(self);
+            return Err(ConnectError {
+                checkpoint: self,
+                value,
+            });
+        }
+        // For adjacent blocks only, validate that a declared prev_blockhash links correctly.
+        // Sparse pushes (gap > 1) skip this check: intermediate blocks are absent.
+        if height == self.height() + 1 && value.prev_blockhash().is_some_and(|h| h != self.hash()) {
+            return Err(ConnectError {
+                checkpoint: self,
+                value,
+            });
         }
         let new_index = self.0.index + 1;
         let skip_target = get_skip_index(new_index);
@@ -163,88 +185,41 @@ impl<T: ToBlockHash> CheckPoint<T> {
 
     /// Extend the chain with an iterator of `(height, value)` entries.
     ///
-    /// Returns `Err(self_clone)` if any entry has a non-increasing height.
-    pub fn extend(self, items: impl IntoIterator<Item = (u32, T)>) -> Result<Self, Self> {
-        let mut curr = self.clone();
-        for (height, value) in items {
-            curr = curr.push(height, value).map_err(|_| self.clone())?;
-        }
-        Ok(curr)
-    }
-}
-
-impl<T: ToBlockHash + HasPrevBlockhash> CheckPoint<T> {
-    /// Push a new block onto the chain, with optional `prev_blockhash` validation.
-    ///
-    /// Returns `Err(ConnectError)` in two cases:
-    /// - `height <= self.height()` — the height is not strictly greater than the current tip
-    /// - `height == self.height() + 1 && value.prev_blockhash() != self.hash()` — the block
-    ///   is directly adjacent but does not link to the current tip
-    ///
-    /// Sparse pushes (gap > 1) are allowed without a `prev_blockhash` check, since
-    /// intermediate blocks are simply absent from the checkpoint chain.
-    pub fn push_connected(self, height: u32, value: T) -> Result<Self, ConnectError<T>> {
-        // Height must always be strictly greater.
-        if self.height() >= height {
-            return Err(ConnectError {
-                checkpoint: self,
-                value,
-            });
-        }
-        // For adjacent blocks only, validate that prev_blockhash links correctly.
-        // Sparse pushes (gap > 1) skip this check: intermediate blocks are absent.
-        if height == self.height() + 1 && value.prev_blockhash() != self.hash() {
-            return Err(ConnectError {
-                checkpoint: self,
-                value,
-            });
-        }
-        // Preconditions are satisfied; push cannot fail.
-        match self.push(height, value) {
-            Ok(cp) => Ok(cp),
-            Err(_) => unreachable!("height was verified to be strictly greater"),
-        }
-    }
-
-    /// Extend the chain with connected `(height, value)` entries.
-    ///
-    /// Each entry must satisfy the same preconditions as [`push_connected`](Self::push_connected).
-    /// On failure, the error contains the last successfully built checkpoint and the
-    /// first rejected value.
-    pub fn extend_connected(
+    /// Each entry must satisfy the same preconditions as [`push`](Self::push). On failure,
+    /// the error contains the last successfully built checkpoint and the first rejected value.
+    pub fn extend(
         self,
         items: impl IntoIterator<Item = (u32, T)>,
     ) -> Result<Self, ConnectError<T>> {
         let mut curr = self;
         for (height, value) in items {
-            curr = curr.push_connected(height, value)?;
+            curr = curr.push(height, value)?;
         }
         Ok(curr)
     }
 }
 
-impl<T: ToBlockHash + HasPrevBlockhash + Clone> CheckPoint<T> {
-    /// Insert `value` at `height`, enforcing `prev_blockhash` connectivity.
-    ///
-    /// Behaves like [`insert`](Self::insert) but additionally validates the
-    /// `prev_blockhash` link between adjacent checkpoints:
+impl<T: Block + Clone> CheckPoint<T> {
+    /// Insert or replace `value` at `height`, enforcing `prev_blockhash` connectivity whenever
+    /// `value` declares one.
     ///
     /// - If a checkpoint at `height` already exists with the same hash, returns `self`
     ///   unchanged.
-    /// - If the checkpoint at `height - 1` has a hash that conflicts with
+    /// - If a conflicting value exists at `height` instead, all checkpoints at and above it
+    ///   are dropped.
+    /// - If the checkpoint at `height - 1` has a hash that conflicts with a declared
     ///   `value.prev_blockhash()`, that checkpoint is *displaced* (evicted along with
     ///   everything above it).
     /// - After inserting, any tail blocks that were above the insertion point are
-    ///   re-validated via [`push_connected`](Self::push_connected). The first block
-    ///   that no longer connects causes the chain to be truncated there; the last
-    ///   valid checkpoint is returned.
+    ///   re-validated via [`push`](Self::push). The first block that no longer connects
+    ///   causes the chain to be truncated there; the last valid checkpoint is returned.
     ///
     /// # Panics
     ///
     /// Panics if insertion implies a different genesis hash than the one anchoring
     /// the chain (height 0 is immutable).
     #[must_use]
-    pub fn insert_connected(self, height: u32, value: T) -> Self {
+    pub fn insert(self, height: u32, value: T) -> Self {
         let mut cp = self.clone();
         let mut tail: Vec<(u32, T)> = vec![];
 
@@ -253,7 +228,7 @@ impl<T: ToBlockHash + HasPrevBlockhash + Clone> CheckPoint<T> {
             if cp.height() == 0 {
                 let implied_genesis = match height {
                     0 => Some(value.to_blockhash()),
-                    1 => Some(value.prev_blockhash()),
+                    1 => value.prev_blockhash(),
                     _ => None,
                 };
                 if let Some(hash) = implied_genesis {
@@ -271,7 +246,9 @@ impl<T: ToBlockHash + HasPrevBlockhash + Clone> CheckPoint<T> {
                 }
                 // Hash conflict at this height: evict everything at and above.
                 tail.clear();
-            } else if cp.height() + 1 == height && value.prev_blockhash() != cp.hash() {
+            } else if cp.height() + 1 == height
+                && value.prev_blockhash().is_some_and(|h| h != cp.hash())
+            {
                 // Displacement: the adjacent-below checkpoint conflicts with
                 // `value.prev_blockhash()`. Evict it along with everything above;
                 // it will not be used as the base.
@@ -291,9 +268,9 @@ impl<T: ToBlockHash + HasPrevBlockhash + Clone> CheckPoint<T> {
         tail.push((height, value));
         let ascending: Vec<(u32, T)> = tail.into_iter().rev().collect();
 
-        // Rebuild the chain above the base. `push_connected` re-validates adjacency:
-        // any tail block whose `prev_blockhash` conflicts with its predecessor causes
-        // the chain to be truncated and the last valid checkpoint is returned.
+        // Rebuild the chain above the base. `push` re-validates adjacency: any tail block
+        // whose `prev_blockhash` conflicts with its predecessor causes the chain to be
+        // truncated and the last valid checkpoint is returned.
         let seed = match base {
             Some(base_cp) => base_cp,
             None => {
@@ -303,7 +280,7 @@ impl<T: ToBlockHash + HasPrevBlockhash + Clone> CheckPoint<T> {
                 let (height, value) = iter.next().expect("tail always contains the inserted value");
                 let mut curr = CheckPoint::new(height, value);
                 for (height, value) in iter {
-                    curr = match curr.push_connected(height, value) {
+                    curr = match curr.push(height, value) {
                         Ok(cp) => cp,
                         Err(ConnectError { checkpoint, .. }) => return checkpoint,
                     };
@@ -314,7 +291,7 @@ impl<T: ToBlockHash + HasPrevBlockhash + Clone> CheckPoint<T> {
 
         let mut curr = seed;
         for (height, value) in ascending {
-            curr = match curr.push_connected(height, value) {
+            curr = match curr.push(height, value) {
                 Ok(cp) => cp,
                 Err(ConnectError { checkpoint, .. }) => return checkpoint,
             };
@@ -472,36 +449,6 @@ impl<T> CheckPoint<T> {
     }
 }
 
-impl<T: Clone + PartialEq + ToBlockHash + core::fmt::Debug> CheckPoint<T> {
-    /// Insert or replace a checkpoint at `height`.
-    ///
-    /// If an identical value already exists at `height`, the chain is unchanged.
-    /// If a conflicting value exists, all checkpoints above it are dropped.
-    /// Panics if trying to replace the genesis block.
-    #[must_use]
-    pub fn insert(self, height: u32, value: T) -> Self {
-        let mut cp = self.clone();
-        let mut tail: Vec<(u32, T)> = vec![];
-        let base = loop {
-            if cp.height() == height {
-                if cp.value() == &value {
-                    return self;
-                }
-                assert_ne!(cp.height(), 0, "cannot replace genesis block");
-                tail = vec![];
-                break cp.prev().expect("can't be called on genesis block");
-            }
-            if cp.height() < height {
-                break cp;
-            }
-            tail.push((cp.height(), cp.value().clone()));
-            cp = cp.prev().expect("will break before genesis block");
-        };
-        base.extend(core::iter::once((height, value)).chain(tail.into_iter().rev()))
-            .expect("tail is in order")
-    }
-}
-
 /// Iterator over a [`CheckPoint`] chain from tip toward genesis.
 pub struct CheckPointIter<T> {
     current: Option<Arc<Node<T>>>,
@@ -583,116 +530,121 @@ mod test {
         cp
     }
 
-    // --- Invariants: `push_connected` / `extend_connected` / `ConnectError` ---
+    // --- Invariants: `push` / `extend` / `ConnectError` ---
 
     #[test]
-    fn push_connected_rejects_non_increasing_height() {
+    fn push_rejects_non_increasing_height() {
         let cp = CheckPoint::new(5, genesis());
         let h = header(genesis().block_hash(), Some(1));
 
-        let err = cp.clone().push_connected(5, h).unwrap_err();
+        let err = cp.clone().push(5, h).unwrap_err();
         assert_eq!(err.checkpoint.height(), 5, "tip is returned unchanged on error");
         assert_eq!(err.value, h);
 
-        let err = cp.push_connected(4, h).unwrap_err();
+        let err = cp.push(4, h).unwrap_err();
         assert_eq!(err.value, h);
     }
 
     #[test]
-    fn push_connected_rejects_adjacent_prev_blockhash_mismatch() {
+    fn push_rejects_adjacent_prev_blockhash_mismatch() {
         let gen = genesis();
         let cp = CheckPoint::new(0, gen);
         // `h`'s prev_blockhash doesn't match `gen`'s hash.
         let h = header(BlockHash::all_zeros(), Some(1));
 
-        let err = cp.clone().push_connected(1, h).unwrap_err();
+        let err = cp.clone().push(1, h).unwrap_err();
         assert_eq!(err.checkpoint.hash(), gen.block_hash());
         assert_eq!(err.value, h);
     }
 
     #[test]
-    fn push_connected_accepts_adjacent_match() {
+    fn push_accepts_adjacent_match() {
         let gen = genesis();
         let h = header(gen.block_hash(), Some(1));
 
-        let cp = CheckPoint::new(0, gen).push_connected(1, h).unwrap();
+        let cp = CheckPoint::new(0, gen).push(1, h).unwrap();
         assert_eq!(cp.hash(), h.block_hash());
     }
 
     #[test]
-    fn push_connected_skips_check_on_gap() {
+    fn push_skips_check_on_gap() {
         let gen = genesis();
         // `h`'s prev_blockhash doesn't match `gen`, but height 2 is a gapped push
         // (height 1 is absent), so the linkage check doesn't apply.
         let h = header(BlockHash::all_zeros(), Some(2));
 
-        let cp = CheckPoint::new(0, gen).push_connected(2, h).unwrap();
+        let cp = CheckPoint::new(0, gen).push(2, h).unwrap();
         assert_eq!(cp.hash(), h.block_hash());
     }
 
     #[test]
-    fn extend_connected_stops_at_first_broken_link() {
+    fn push_skips_check_for_unvalidatable_type() {
+        // `BlockHash` never declares a `prev_blockhash`, so an adjacent push is accepted even
+        // though it couldn't possibly be verified.
+        let gen: BlockHash = Hash::hash(b"genesis");
+        let h1: BlockHash = Hash::hash(b"1");
+
+        let cp = CheckPoint::new(0, gen).push(1, h1).unwrap();
+        assert_eq!(cp.hash(), h1);
+    }
+
+    #[test]
+    fn extend_stops_at_first_broken_link() {
         let gen = genesis();
         let h1 = header(gen.block_hash(), Some(1));
         let broken_h2 = header(BlockHash::all_zeros(), Some(2)); // doesn't extend h1
 
-        let err = CheckPoint::new(0, gen)
-            .extend_connected([(1, h1), (2, broken_h2)])
-            .unwrap_err();
+        let err = CheckPoint::new(0, gen).extend([(1, h1), (2, broken_h2)]).unwrap_err();
         assert_eq!(err.checkpoint.height(), 1, "should retain the successfully pushed h1");
         assert_eq!(err.checkpoint.hash(), h1.block_hash());
         assert_eq!(err.value, broken_h2);
     }
 
-    // --- Invariants: `insert_connected` ---
+    // --- Invariants: `insert` ---
 
     #[test]
-    fn insert_connected_noop_on_identical_value() {
+    fn insert_noop_on_identical_value() {
         let gen = genesis();
         let h1 = header(gen.block_hash(), Some(1));
-        let cp = CheckPoint::new(0, gen).push_connected(1, h1).unwrap();
+        let cp = CheckPoint::new(0, gen).push(1, h1).unwrap();
 
-        let same = cp.clone().insert_connected(1, h1);
+        let same = cp.clone().insert(1, h1);
         assert!(same.eq_ptr(&cp), "identical insert must return the chain unchanged");
     }
 
     #[test]
-    fn insert_connected_evicts_above_on_hash_conflict_at_height() {
+    fn insert_evicts_above_on_hash_conflict_at_height() {
         let gen = genesis();
         let h1 = header(gen.block_hash(), Some(1));
         let h2 = header(h1.block_hash(), Some(2));
-        let cp = CheckPoint::new(0, gen)
-            .push_connected(1, h1)
-            .unwrap()
-            .push_connected(2, h2)
-            .unwrap();
+        let cp = CheckPoint::new(0, gen).push(1, h1).unwrap().push(2, h2).unwrap();
 
         // A conflicting header at height 1 evicts both h1 and h2 (which sits above it).
         let h1_conflict = header(gen.block_hash(), Some(101));
-        let cp = cp.insert_connected(1, h1_conflict);
+        let cp = cp.insert(1, h1_conflict);
         assert_eq!(cp.height(), 1);
         assert_eq!(cp.hash(), h1_conflict.block_hash());
     }
 
     #[test]
-    fn insert_connected_displaces_adjacent_below_on_prev_blockhash_conflict() {
+    fn insert_displaces_adjacent_below_on_prev_blockhash_conflict() {
         let gen = genesis();
         let h1 = header(gen.block_hash(), Some(1));
         // h3 is gapped (height 2 absent), so its prev_blockhash was never validated.
         let h3 = header(BlockHash::all_zeros(), Some(3));
-        let cp = CheckPoint::new(0, gen).push_connected(1, h1).unwrap().insert(3, h3);
+        let cp = CheckPoint::new(0, gen).push(1, h1).unwrap().insert(3, h3);
 
         // h2's prev_blockhash doesn't match h1's hash: h1 is displaced (along with h3,
         // which sits above it), rather than becoming h2's validated parent.
         let h2 = header(BlockHash::all_zeros(), Some(2));
-        let cp = cp.insert_connected(2, h2);
+        let cp = cp.insert(2, h2);
         assert_eq!(cp.height(), 2);
         assert_eq!(cp.hash(), h2.block_hash());
         assert!(cp.get(1).is_none(), "h1 should have been displaced");
     }
 
     #[test]
-    fn insert_connected_truncates_tail_that_no_longer_connects() {
+    fn insert_truncates_tail_that_no_longer_connects() {
         let gen = genesis();
         // h3 is gapped (height 2 absent), so its prev_blockhash was never validated
         // against a real predecessor.
@@ -702,17 +654,17 @@ mod test {
         // Filling the gap at height 2 makes h3 adjacent to h2; since h3's prev_blockhash
         // doesn't actually point to h2, the rebuild truncates the chain at h2.
         let h2 = header(gen.block_hash(), Some(2));
-        let cp = cp.insert_connected(2, h2);
+        let cp = cp.insert(2, h2);
         assert_eq!(cp.height(), 2, "h3 must be dropped since it no longer connects");
         assert_eq!(cp.hash(), h2.block_hash());
     }
 
     #[test]
     #[should_panic(expected = "inserted data implies a different genesis")]
-    fn insert_connected_panics_on_genesis_mismatch() {
+    fn insert_panics_on_genesis_mismatch() {
         let cp = CheckPoint::new(0, genesis());
         let other_genesis = header(BlockHash::all_zeros(), Some(999));
-        let _ = cp.insert_connected(0, other_genesis);
+        let _ = cp.insert(0, other_genesis);
     }
 
     // A canary for the hand-written iterative `Drop for Node<T>`: dropping a deep chain via the
