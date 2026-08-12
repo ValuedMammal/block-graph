@@ -1589,7 +1589,7 @@ mod test {
     }
 
     #[test]
-    fn test_connect_blocks() {
+    fn test_connect_block() {
         let genesis = genesis_header();
         let mut graph = BlockGraph::from_genesis(genesis);
 
