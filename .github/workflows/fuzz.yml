@@ -53,6 +53,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy the fuzz crate
         working-directory: fuzz
+        env:
+          RUSTFLAGS: --cfg fuzzing
         run: cargo clippy --all-targets -- -Dwarnings
       - name: Build all fuzz targets
         working-directory: fuzz
