@@ -23,6 +23,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   NIGHTLY: nightly-2026-07-25
+  CARGO_FUZZ_VERSION: 0.13.2
 
 jobs:
   build:
@@ -38,12 +39,20 @@ jobs:
           # The action defaults this to `-D warnings`, which would clobber the
           # `--cfg fuzzing` RUSTFLAGS set per-step below.
           rustflags: ""
+          # cargo-fuzz is cached separately below, keyed on its own version.
+          cache-bin: false
           cache-workspaces: |
             .
             fuzz
-      - uses: taiki-e/install-action@v2
+      - name: Cache cargo-fuzz
+        id: cargo-fuzz
+        uses: actions/cache@v4
         with:
-          tool: cargo-fuzz
+          path: ~/.cargo/bin/cargo-fuzz
+          key: cargo-fuzz-${{ env.CARGO_FUZZ_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ env.NIGHTLY }}
+      - name: Install cargo-fuzz
+        if: steps.cargo-fuzz.outputs.cache-hit != 'true'
+        run: cargo install --locked cargo-fuzz@${{ env.CARGO_FUZZ_VERSION }}
       - name: Clippy the `cfg(fuzzing)` path
         env:
           RUSTFLAGS: --cfg fuzzing
@@ -79,12 +88,20 @@ jobs:
         with:
           toolchain: ${{ env.NIGHTLY }}
           rustflags: ""
+          # cargo-fuzz is cached separately below, keyed on its own version.
+          cache-bin: false
           cache-workspaces: |
             .
             fuzz
-      - uses: taiki-e/install-action@v2
+      - name: Cache cargo-fuzz
+        id: cargo-fuzz
+        uses: actions/cache@v4
         with:
-          tool: cargo-fuzz
+          path: ~/.cargo/bin/cargo-fuzz
+          key: cargo-fuzz-${{ env.CARGO_FUZZ_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ env.NIGHTLY }}
+      - name: Install cargo-fuzz
+        if: steps.cargo-fuzz.outputs.cache-hit != 'true'
+        run: cargo install --locked cargo-fuzz@${{ env.CARGO_FUZZ_VERSION }}
       - name: Select run duration
         id: cfg
         env:
