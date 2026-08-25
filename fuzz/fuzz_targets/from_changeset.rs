@@ -59,7 +59,10 @@ fuzz_target!(|raw: RawChangeSet| {
         }
         Err(FromChangeSetError::MissingGenesis) => {}
         Err(FromChangeSetError::MultipleGenesisBlocks { first, second }) => {
-            assert_ne!(first, second, "MultipleGenesisBlocks must name two distinct blocks\ncontext: {ctx}");
+            assert_ne!(
+                first, second,
+                "MultipleGenesisBlocks must name two distinct blocks\ncontext: {ctx}"
+            );
         }
         Err(FromChangeSetError::InvalidEdgeHeight { parent, child }) => {
             assert!(

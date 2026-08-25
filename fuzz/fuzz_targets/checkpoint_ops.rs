@@ -10,9 +10,15 @@ use libfuzzer_sys::fuzz_target;
 #[derive(Debug, arbitrary::Arbitrary)]
 enum CpOp {
     /// Push onto the tip; `height_delta` of 0 exercises the non-increasing-height rejection.
-    Push { height_delta: u8, id: u8 },
+    Push {
+        height_delta: u8,
+        id: u8,
+    },
     /// Insert at an arbitrary height (height 0 is skipped: replacing genesis panics by design).
-    Insert { height: u16, id: u8 },
+    Insert {
+        height: u16,
+        id: u8,
+    },
     Get(u16),
     Range(u16, u16),
 }
@@ -84,8 +90,12 @@ fuzz_target!(|ops: Vec<CpOp>| {
                 if a > b {
                     continue;
                 }
-                let expected: Vec<(u32, BlockHash)> =
-                    model.iter().rev().filter(|(h, _)| (a..b).contains(h)).copied().collect();
+                let expected: Vec<(u32, BlockHash)> = model
+                    .iter()
+                    .rev()
+                    .filter(|(h, _)| (a..b).contains(h))
+                    .copied()
+                    .collect();
                 let got: Vec<(u32, BlockHash)> =
                     cp.range(a..b).map(|c| (c.height(), c.hash())).collect();
                 assert_eq!(got, expected, "range({a}..{b}) mismatch\ncontext: {ctx}");
@@ -93,6 +103,10 @@ fuzz_target!(|ops: Vec<CpOp>| {
         }
 
         assert_eq!(cp.len(), model.len(), "len() mismatch\ncontext: {ctx}");
-        assert_eq!(cp.index() as usize, model.len() - 1, "index() mismatch\ncontext: {ctx}");
+        assert_eq!(
+            cp.index() as usize,
+            model.len() - 1,
+            "index() mismatch\ncontext: {ctx}"
+        );
     }
 });
