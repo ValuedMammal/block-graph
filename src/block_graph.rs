@@ -436,8 +436,9 @@ impl<T: Block + PartialEq + Debug + Clone> BlockGraph<T> {
     /// declared `prev_blockhash` whenever `T` provides one; gapped connections are unaffected,
     /// since intermediate blocks are legitimately absent from the graph.
     ///
-    /// Errors if a checkpoint item doesn't declare its parent, indicating no common ancestor
-    /// was found between `checkpoint` and this `BlockGraph`.
+    /// Errors if a checkpoint item doesn't declare its parent and isn't already recorded in
+    /// this `BlockGraph` at the same height, indicating no common ancestor was found between
+    /// `checkpoint` and this `BlockGraph`.
     /// Or if an item can't be connected due to an invalid parent-child dependency.
     /// All items are validated before any of them are applied, so the graph is left
     /// unchanged if an error is returned.
@@ -449,11 +450,25 @@ impl<T: Block + PartialEq + Debug + Clone> BlockGraph<T> {
         items.reverse();
 
         // Every item must declare its parent, otherwise we don't know where the update connects.
+        //
+        // The one item that can legitimately lack a parent is the update's *root* checkpoint,
+        // which is an anchor rather than something to connect. `merge_chains` diffs the update
+        // against the canonical tip chain only, so it surfaces that root whenever the tip chain
+        // no longer covers it — but the graph knows about far more blocks than that chain, and
+        // if the root is already recorded here at the very same height there is nothing to
+        // connect and no edge to add. Drop it instead of erroring; otherwise replaying an update
+        // whose base was moved off the tip chain by reconciliation would fail (see
+        // `apply_update_is_idempotent_when_reconciliation_moves_the_base_off_the_tip_chain`).
         let items = items
             .into_iter()
-            .map(|(block_id, value, prev)| {
-                prev.map(|prev_hash| (block_id, value, prev_hash))
-                    .ok_or(ApplyUpdateError::MissingParent)
+            .filter_map(|(block_id, value, prev)| match prev {
+                Some(prev_hash) => Some(Ok((block_id, value, prev_hash))),
+                None if self.blocks.get(&block_id.hash).map(|(height, _)| *height)
+                    == Some(block_id.height) =>
+                {
+                    None
+                }
+                None => Some(Err(ApplyUpdateError::MissingParent)),
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -1059,8 +1074,8 @@ impl core::error::Error for ConnectBlockError {}
 /// Error returned by [`BlockGraph::apply_update`].
 #[derive(Debug, PartialEq)]
 pub enum ApplyUpdateError {
-    /// A block in the update has no declared parent hash, so its connection
-    /// point in the graph cannot be determined.
+    /// A block in the update has no declared parent hash and isn't already known to the graph
+    /// at that height, so its connection point in the graph cannot be determined.
     MissingParent,
     /// A block could not be connected due to an invalid parent-child height relationship.
     ConnectBlock(ConnectBlockError),
@@ -2264,6 +2279,75 @@ mod test {
 
         let changeset = graph.apply_update(cp).unwrap();
         assert_eq!(changeset.blocks, [(h3.block_hash(), (3u32, h3))].into());
+    }
+
+    #[test]
+    fn apply_update_is_idempotent_when_reconciliation_moves_the_base_off_the_tip_chain() {
+        // Regression test: `merge_chains` decides what needs connecting by
+        // diffing the update against the *canonical tip chain* only, but the graph knows about
+        // far more blocks than that chain. The update's root checkpoint declares no parent (it's
+        // an anchor, not something to connect), which is fine while it still sits on the tip
+        // chain — but a successful `apply_update` re-canonicalizes, and the new best chain can
+        // legitimately no longer contain that base. Replaying the very same update then diffed
+        // the base as "missing" and pushed it as an item with no declared parent, which
+        // `apply_update` rejected with `MissingParent`, breaking idempotence.
+        //
+        // Found by the `apply_update` fuzz target
+        // (crash-3c02bb90c7213ec78b000e66f1ab72c8fadf2f99).
+        let genesis = genesis_header();
+        let mut graph = BlockGraph::from_genesis(genesis);
+
+        // A branch that is *not* reachable forward from the root: `p` hangs off a parent hash
+        // the graph has never seen, so `canonicalize` can't discover it yet.
+        let unknown = header(BlockHash::all_zeros(), Some(90)).block_hash();
+        let p = header(unknown, Some(91));
+        graph.connect_block(10, p, unknown).unwrap();
+        let f = header(p.block_hash(), Some(92));
+        graph.connect_block(100, f, p.block_hash()).unwrap();
+
+        // `b` becomes the tip.
+        let b = header(genesis.block_hash(), Some(1));
+        graph.apply_update(CheckPoint::new(0, genesis).insert(5, b)).unwrap();
+        assert_eq!(
+            graph.tip().block_id(),
+            BlockId {
+                height: 5,
+                hash: b.block_hash()
+            }
+        );
+
+        // `n` extends `b`. Record the edge `n -> f` up front (a gapped/forward-referenced
+        // connection, made while `n` itself is still unknown) so that connecting `n` is what
+        // finally makes the tall `f` branch reachable from the root.
+        let n = header(b.block_hash(), Some(2));
+        graph.connect_block(100, f, n.block_hash()).unwrap();
+
+        let update = CheckPoint::new(5, b).push(6, n).unwrap();
+        graph.apply_update(update.clone()).unwrap();
+        graph.check_invariants().unwrap();
+        graph.check_best_tip().unwrap();
+
+        // Reconciliation promoted the taller `f` branch, whose real ancestry runs through `p`,
+        // not through `n`/`b`. The update's base is no longer on the tip chain.
+        assert_eq!(
+            graph.tip().block_id(),
+            BlockId {
+                height: 100,
+                hash: f.block_hash()
+            }
+        );
+        assert!(graph.tip().get(5).is_none(), "the update's base is off the tip chain");
+
+        // Replaying the identical update must still be an accepted no-op.
+        let before = graph.clone();
+        let changeset = graph
+            .apply_update(update)
+            .expect("replaying a successful update must not error");
+        assert!(changeset.is_empty(), "replaying a successful update adds nothing");
+        assert_eq!(
+            graph, before,
+            "replaying a successful update must not mutate the graph"
+        );
     }
 
     // --- `check_invariants` / `check_best_tip` ---
