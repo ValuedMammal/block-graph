@@ -174,6 +174,9 @@ impl<T: Block + PartialEq + Debug + Clone> BlockGraph<T> {
         // re-traversed once per incoming path, and a cyclic edge (e.g. corrupt or adversarial
         // data ingested via `from_changeset`) sends this into an infinite loop rather than just
         // being slow.
+        //
+        // `visited` doubles as the set of root-reachable hashes, reused below to keep the
+        // backward walk from wandering onto a recorded parent this forward walk never reached.
         let mut visited = HashSet::<BlockHash>::new();
         let mut tips = HashSet::<BlockHash>::new();
         let mut queue = vec![];
@@ -202,10 +205,20 @@ impl<T: Block + PartialEq + Debug + Clone> BlockGraph<T> {
             .max_by_key(|id| (id.height, core::cmp::Reverse(id.hash)))
             .expect("failed to find best tip");
 
-        // We have a new tip. Populate the canonical block data by traversing
-        // back to the root and collecting block data along the way.
-        let mut canonical_values: Vec<(u32, T)> = self
-            .iter_block_graph(best_block.hash)
+        // We have a new tip. Populate the canonical block data by traversing back to the root
+        // and collecting block data along the way, restricted to `visited` so a block with more
+        // than one recorded parent can't pick one the forward walk never reached.
+        let full_chain: Vec<(u32, BlockHash, T)> =
+            self.iter_block_graph(best_block.hash, &visited).collect();
+
+        assert_eq!(
+            full_chain.last().map(|(_, hash, _)| *hash),
+            Some(root),
+            "canonicalize's backward walk from {best_block:?} failed to reach root {root}",
+        );
+
+        let mut canonical_values: Vec<(u32, T)> = full_chain
+            .into_iter()
             .take_while(|(_, hash, _)| *hash != root)
             .map(|(height, _, value)| (height, value))
             .collect();
@@ -234,28 +247,33 @@ impl<T: Block + PartialEq + Debug + Clone> BlockGraph<T> {
         changeset
     }
 
-    /// Find the best parent [`BlockId`] of the given `hash` if it exists in `self.parents`.
+    /// Find the best parent [`BlockId`] of the given `hash` that is present in `visited`.
     ///
-    /// The "best" parent is the one with the highest order [`BlockId`].
-    //
-    // Open design question: it's not established that "highest order" (by `(height, hash)`) is
-    // always the *correct* choice for reconstructing actual ancestry when a block has more than
-    // one recorded parent, versus e.g. "whichever parent was most recently recorded". A block
-    // with two legitimate, same-height parents at a non-root height isn't currently caught by
-    // any validation, so this could in principle pick the "wrong" one without violating
-    // `check_invariants`/`check_best_tip`.
-    fn parent(&self, hash: &BlockHash) -> Option<BlockId> {
-        self.parents.get(hash)?.iter().last().copied()
+    /// The "best" parent is the highest-order [`BlockId`] among those `visited` confirms are
+    /// reachable from the graph's root, so the backward walk built on this can never step onto a
+    /// parent the forward walk never reached.
+    fn parent_within(&self, hash: &BlockHash, visited: &HashSet<BlockHash>) -> Option<BlockId> {
+        self.parents
+            .get(hash)?
+            .iter()
+            .rev()
+            .find(|id| visited.contains(&id.hash))
+            .copied()
     }
 
-    /// Iterate over `(height, blockhash, value)` tuples in the [`BlockGraph`] starting from the given [`BlockHash`].
-    fn iter_block_graph(&self, hash: BlockHash) -> impl Iterator<Item = (u32, BlockHash, T)> + '_ {
+    /// Iterate over `(height, blockhash, value)` tuples in the [`BlockGraph`] starting from the
+    /// given [`BlockHash`], walking backward only through parents present in `visited`.
+    fn iter_block_graph<'a>(
+        &'a self,
+        hash: BlockHash,
+        visited: &'a HashSet<BlockHash>,
+    ) -> impl Iterator<Item = (u32, BlockHash, T)> + 'a {
         let mut current_hash = Some(hash);
 
         core::iter::from_fn(move || {
             let hash = current_hash?;
             let (height, value) = self.blocks.get(&hash).cloned()?;
-            current_hash = self.parent(&hash).map(|id| id.hash);
+            current_hash = self.parent_within(&hash, visited).map(|id| id.hash);
             Some((height, hash, value))
         })
     }
@@ -436,8 +454,9 @@ impl<T: Block + PartialEq + Debug + Clone> BlockGraph<T> {
     /// declared `prev_blockhash` whenever `T` provides one; gapped connections are unaffected,
     /// since intermediate blocks are legitimately absent from the graph.
     ///
-    /// Errors if a checkpoint item doesn't declare its parent, indicating no common ancestor
-    /// was found between `checkpoint` and this `BlockGraph`.
+    /// Errors if a checkpoint item doesn't declare its parent and isn't already recorded in
+    /// this `BlockGraph` at the same height, indicating no common ancestor was found between
+    /// `checkpoint` and this `BlockGraph`.
     /// Or if an item can't be connected due to an invalid parent-child dependency.
     /// All items are validated before any of them are applied, so the graph is left
     /// unchanged if an error is returned.
@@ -449,11 +468,20 @@ impl<T: Block + PartialEq + Debug + Clone> BlockGraph<T> {
         items.reverse();
 
         // Every item must declare its parent, otherwise we don't know where the update connects.
+        // The one exception is the update's *root* checkpoint: it's an anchor, not something to
+        // connect, so a root already recorded at the same height contributes nothing and is
+        // dropped rather than rejected. `merge_chains` can surface it as parentless because it
+        // diffs against the tip chain only, which reconciliation may have since moved past.
         let items = items
             .into_iter()
-            .map(|(block_id, value, prev)| {
-                prev.map(|prev_hash| (block_id, value, prev_hash))
-                    .ok_or(ApplyUpdateError::MissingParent)
+            .filter_map(|(block_id, value, prev)| match prev {
+                Some(prev_hash) => Some(Ok((block_id, value, prev_hash))),
+                None if self.blocks.get(&block_id.hash).map(|(height, _)| *height)
+                    == Some(block_id.height) =>
+                {
+                    None
+                }
+                None => Some(Err(ApplyUpdateError::MissingParent)),
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -628,6 +656,25 @@ impl<T: Block + PartialEq + Debug + Clone> BlockGraph<T> {
                 ))
             }
             None => return Err("tip chain is empty".into()),
+        }
+
+        // 6. every adjacent pair of checkpoints in the tip chain is connected by a real recorded
+        // edge — the lower checkpoint's `BlockId` must appear in `parents[higher.hash]`.
+        let mut tip_pairs = self.tip.iter().peekable();
+        while let Some(higher) = tip_pairs.next() {
+            if let Some(lower) = tip_pairs.peek() {
+                if !self
+                    .parents
+                    .get(&higher.hash())
+                    .is_some_and(|ids| ids.contains(&lower.block_id()))
+                {
+                    return Err(format!(
+                        "tip chain has no recorded edge between adjacent checkpoints {:?} and {:?}",
+                        higher.block_id(),
+                        lower.block_id(),
+                    ));
+                }
+            }
         }
 
         Ok(())
@@ -1059,8 +1106,8 @@ impl core::error::Error for ConnectBlockError {}
 /// Error returned by [`BlockGraph::apply_update`].
 #[derive(Debug, PartialEq)]
 pub enum ApplyUpdateError {
-    /// A block in the update has no declared parent hash, so its connection
-    /// point in the graph cannot be determined.
+    /// A block in the update has no declared parent hash and isn't already known to the graph
+    /// at that height, so its connection point in the graph cannot be determined.
     MissingParent,
     /// A block could not be connected due to an invalid parent-child height relationship.
     ConnectBlock(ConnectBlockError),
@@ -1522,6 +1569,8 @@ mod test {
 
         let h1 = header(genesis.block_hash(), Some(1));
         let h2 = header(h1.block_hash(), Some(2));
+        let visited: HashSet<BlockHash> =
+            [genesis.block_hash(), h1.block_hash(), h2.block_hash()].into();
 
         // Connect block 1
         let cs = graph.connect_block(1, h1, genesis.block_hash()).unwrap();
@@ -1543,7 +1592,7 @@ mod test {
             "Hash 1 should extend from hash 0"
         );
         assert_eq!(
-            graph.parent(&h1.block_hash()).unwrap(),
+            graph.parent_within(&h1.block_hash(), &visited).unwrap(),
             (0, genesis.block_hash()).into(),
             "Block 0 should be parent of block 1"
         );
@@ -1568,7 +1617,7 @@ mod test {
             "Hash 2 should extend from hash 1"
         );
         assert_eq!(
-            graph.parent(&h2.block_hash()).unwrap(),
+            graph.parent_within(&h2.block_hash(), &visited).unwrap(),
             (1, h1.block_hash()).into(),
             "Block 1 should be parent of block 2"
         );
@@ -2264,6 +2313,127 @@ mod test {
 
         let changeset = graph.apply_update(cp).unwrap();
         assert_eq!(changeset.blocks, [(h3.block_hash(), (3u32, h3))].into());
+    }
+
+    #[test]
+    fn apply_update_is_idempotent_when_reconciliation_moves_the_base_off_the_tip_chain() {
+        // Regression test: `merge_chains` diffs the update against the canonical tip chain only,
+        // but a successful `apply_update` re-canonicalizes, and the new best chain can
+        // legitimately no longer contain the update's base. Replaying the same update then
+        // diffed the base as "missing" and pushed it with no declared parent, which
+        // `apply_update` rejected with `MissingParent`, breaking idempotence.
+        //
+        // Originally found by the `apply_update` fuzz target
+        // (crash-3c02bb90c7213ec78b000e66f1ab72c8fadf2f99) via a graph shape that also tripped a
+        // separate fabricated-ancestry bug in `canonicalize` (see
+        // `apply_update_does_not_fabricate_ancestry_through_an_unrelated_taller_branch`); this
+        // uses a genuinely unrelated taller sibling instead, so it keeps covering the
+        // idempotence fix regardless of that bug's status.
+        let genesis = genesis_header();
+        let mut graph = BlockGraph::from_genesis(genesis);
+
+        // `b` becomes the tip.
+        let b = header(genesis.block_hash(), Some(1));
+        graph.apply_update(CheckPoint::new(0, genesis).insert(5, b)).unwrap();
+        assert_eq!(graph.tip().hash(), b.block_hash());
+
+        // A taller, unrelated sibling connected directly under genesis (not under `b`).
+        let tall = header(genesis.block_hash(), Some(2));
+        graph.connect_block(100, tall, genesis.block_hash()).unwrap();
+        assert_eq!(
+            graph.tip().hash(),
+            b.block_hash(),
+            "connect_block must not move the tip"
+        );
+
+        // `n` extends `b`, but even with `n` on top, `b`'s branch stays far shorter than `tall`.
+        let n = header(b.block_hash(), Some(3));
+        let update = CheckPoint::new(5, b).push(6, n).unwrap();
+        graph.apply_update(update.clone()).unwrap();
+        graph.check_invariants().unwrap();
+        graph.check_best_tip().unwrap();
+
+        // Reconciliation promoted `tall`, whose real ancestry runs directly from genesis, not
+        // through `b`/`n`. The update's base is no longer on the tip chain.
+        assert_eq!(
+            graph.tip().block_id(),
+            BlockId {
+                height: 100,
+                hash: tall.block_hash()
+            }
+        );
+        assert!(graph.tip().get(5).is_none(), "the update's base is off the tip chain");
+
+        // Replaying the identical update must still be an accepted no-op.
+        let before = graph.clone();
+        let changeset = graph
+            .apply_update(update)
+            .expect("replaying a successful update must not error");
+        assert!(changeset.is_empty(), "replaying a successful update adds nothing");
+        assert_eq!(
+            graph, before,
+            "replaying a successful update must not mutate the graph"
+        );
+    }
+
+    #[test]
+    fn apply_update_does_not_fabricate_ancestry_through_an_unrelated_taller_branch() {
+        // Regression test: `canonicalize` found candidate tips via a *forward* walk over
+        // `next_hashes`, but reconstructed the chain back to root via a separate *backward* walk
+        // over `parents` that picked each step's highest-order recorded parent regardless of
+        // whether the forward walk had ever reached it. When a block had two recorded parents —
+        // one root-reachable, one not — the backward walk could pick the unreachable one and
+        // dead-end short of root; `apply_update` then spliced the resulting chain onto the tip
+        // by height alone, fabricating a parent-child edge that was never actually recorded.
+        let genesis = genesis_header();
+        let mut graph = BlockGraph::from_genesis(genesis);
+
+        // A branch that is *not* reachable forward from the root: `p` hangs off a parent hash
+        // the graph has never seen, so `canonicalize` can't discover it yet.
+        let unknown = header(BlockHash::all_zeros(), Some(90)).block_hash();
+        let p = header(unknown, Some(91));
+        graph.connect_block(10, p, unknown).unwrap();
+        let f = header(p.block_hash(), Some(92));
+        graph.connect_block(100, f, p.block_hash()).unwrap();
+
+        // `b` becomes the tip.
+        let b = header(genesis.block_hash(), Some(1));
+        graph.apply_update(CheckPoint::new(0, genesis).insert(5, b)).unwrap();
+        assert_eq!(graph.tip().hash(), b.block_hash());
+
+        // `n` extends `b`. Record the edge `n -> f` up front (a gapped/forward-referenced
+        // connection, made while `n` itself is still unknown), giving `f` a *second* recorded
+        // parent alongside `p`. Connecting `n` is what finally makes the tall `f` branch
+        // reachable from the root — but only via `n`/`b`, not via `p`.
+        let n = header(b.block_hash(), Some(2));
+        graph.connect_block(100, f, n.block_hash()).unwrap();
+
+        let update = CheckPoint::new(5, b).push(6, n).unwrap();
+        graph.apply_update(update).unwrap();
+        graph.check_invariants().unwrap();
+        graph.check_best_tip().unwrap();
+
+        // `f` is correctly promoted as the new tip...
+        assert_eq!(
+            graph.tip().block_id(),
+            BlockId {
+                height: 100,
+                hash: f.block_hash()
+            }
+        );
+        // ...but its real ancestry runs through `n` and `b`, not through the unreachable `p`.
+        assert_eq!(graph.tip().get(6).map(|cp| cp.hash()), Some(n.block_hash()));
+        assert_eq!(graph.tip().get(5).map(|cp| cp.hash()), Some(b.block_hash()));
+        assert!(
+            graph.tip().iter().all(|cp| cp.hash() != p.block_hash()),
+            "p was never actually connected to the root; it must not appear in the tip chain"
+        );
+
+        let recovered = BlockGraph::from_changeset(graph.initial_changeset()).unwrap().unwrap();
+        assert_eq!(
+            recovered, graph,
+            "roundtrip must match: tip must reflect real ancestry"
+        );
     }
 
     // --- `check_invariants` / `check_best_tip` ---
