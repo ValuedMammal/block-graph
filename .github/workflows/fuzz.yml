@@ -22,7 +22,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  NIGHTLY: nightly-2026-07-25
+  NIGHTLY: nightly-2026-08-01
   CARGO_FUZZ_VERSION: 0.13.2
 
 jobs:

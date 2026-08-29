@@ -15,8 +15,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  STABLE: "1.97.0"
-  NIGHTLY: "nightly-2026-07-25"
+  STABLE: "1.98.0"
+  NIGHTLY: "nightly-2026-08-01"
   MSRV: "1.85.0"
 
 jobs:
