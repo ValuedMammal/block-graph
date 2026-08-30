@@ -1,7 +1,9 @@
 #![no_main]
 
 use bitcoin::BlockHash;
-use block_graph::{BlockGraph, ChangeSet, FromChangeSetError};
+use block_graph::{
+    ApplyChangeSetError, BlockGraph, ChangeSet, ConnectBlockError, FromChangeSetError,
+};
 use libfuzzer_sys::fuzz_target;
 
 use block_graph_fuzz::hash_from_id;
@@ -11,11 +13,20 @@ use block_graph_fuzz::hash_from_id;
 /// `ChangeSet` is the persistence format, so `from_changeset` must handle arbitrary,
 /// attacker-influenced data without panicking: two distinct blocks at height 0 (rejected as
 /// `MultipleGenesisBlocks`), an edge whose child is at a lower height than its parent (rejected
-/// as `InvalidEdgeHeight`), a cycle (also rejected, since every cycle contains at least one such
-/// edge), an edge referencing a missing block, and a block with no incoming edge should all be
-/// reachable shapes here. `InconsistentPrevBlockhash` is not reachable with `T = BlockHash`,
-/// since `Block::prev_blockhash` always returns `None` for it; it only fires for a `T` that
-/// declares a `prev_blockhash` (e.g. `Header`), which isn't fuzzed here.
+/// as `Apply(InvalidEdgeHeight)`), a cycle (also rejected, since every cycle contains at least one
+/// such edge), an edge referencing a missing block, and a block with no incoming edge should all
+/// be reachable shapes here.
+///
+/// Every other `ApplyChangeSetError`/`ConnectBlockError` variant is unreachable through this
+/// single-changeset-onto-fresh-genesis path specifically, not just for `T = BlockHash`:
+/// `apply_changeset`'s checks that compare against *pre-existing* graph state can only fire when
+/// `self` already holds data that conflicts with the incoming changeset, but here `self` is a bare
+/// `from_genesis` graph before `apply_changeset` runs, and `RawChangeSet` can't encode two
+/// different heights for the same hash. `ParentHeightNotSmaller` is `connect_block`-only and
+/// never returned by the changeset validation path at all. `BlockHashMismatch` and the
+/// edge-adjacency flavor of `PrevBlockhashMismatch` are additionally unreachable for
+/// `T = BlockHash` specifically: `to_blockhash`/`prev_blockhash` are the identity/always-`None`,
+/// so `RawChangeSet` can't misconstruct either check's input.
 #[derive(Debug, arbitrary::Arbitrary)]
 struct RawChangeSet {
     /// `(id, height)` pairs describing blocks.
@@ -64,16 +75,37 @@ fuzz_target!(|raw: RawChangeSet| {
                 "MultipleGenesisBlocks must name two distinct blocks\ncontext: {ctx}"
             );
         }
-        Err(FromChangeSetError::InvalidEdgeHeight { parent, child }) => {
+        Err(FromChangeSetError::Apply(ApplyChangeSetError::InvalidEdgeHeight { parent, child })) => {
             assert!(
                 parent.height >= child.height,
                 "InvalidEdgeHeight should only be raised for a non-increasing edge\ncontext: {ctx}"
             );
         }
-        Err(FromChangeSetError::InconsistentPrevBlockhash { .. }) => {
+        Err(FromChangeSetError::Apply(ApplyChangeSetError::BlockHashMismatch { .. })) => {
             unreachable!(
-                "T = BlockHash never declares a prev_blockhash, so this can't be raised\ncontext: {ctx}"
+                "T = BlockHash's to_blockhash is the identity, so RawChangeSet can't construct a \
+                 mismatch\ncontext: {ctx}"
             );
         }
+        Err(FromChangeSetError::Apply(ApplyChangeSetError::ConnectBlock(err))) => match err {
+            ConnectBlockError::ParentHeightNotSmaller => unreachable!(
+                "connect_block-only variant, never returned by the changeset validation path\ncontext: {ctx}"
+            ),
+            ConnectBlockError::PrevBlockhashMismatch => unreachable!(
+                "T = BlockHash never declares a prev_blockhash, so this can't be raised\ncontext: {ctx}"
+            ),
+            ConnectBlockError::HeightConflict { .. } => unreachable!(
+                "requires self to already hold the hash at a conflicting height, but self is a \
+                 bare from_genesis graph here\ncontext: {ctx}"
+            ),
+            ConnectBlockError::ChildHeightNotGreater { .. } => unreachable!(
+                "requires self to already know a child of this hash, but self is a bare \
+                 from_genesis graph here\ncontext: {ctx}"
+            ),
+            ConnectBlockError::HeightZeroReservedForRoot { .. } => unreachable!(
+                "the single height-0 entry is already consumed as genesis before apply_changeset \
+                 runs\ncontext: {ctx}"
+            ),
+        },
     }
 });
