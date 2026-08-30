@@ -539,33 +539,6 @@ impl<T: Block + PartialEq + Debug + Clone> BlockGraph<T> {
     ///
     /// See [`ApplyChangeSetError`]. All of `changeset` is validated before any of it is applied,
     /// so the graph is left unchanged if an error is returned.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use bitcoin::{constants, Network};
-    /// use block_graph::BlockGraph;
-    ///
-    /// let genesis = constants::genesis_block(Network::Regtest).header;
-    /// let mut graph = BlockGraph::from_genesis(genesis);
-    ///
-    /// // A second graph that has advanced by one block.
-    /// let mut other = BlockGraph::from_genesis(genesis);
-    /// let block_1 = bitcoin::block::Header {
-    ///     prev_blockhash: other.tip().hash(),
-    ///     ..genesis
-    /// };
-    /// let update = other.tip().push(1, block_1).unwrap();
-    /// other.apply_update(update).unwrap();
-    ///
-    /// // Replaying its changeset advances `graph` to the same tip.
-    /// let effective = graph.apply_changeset(other.initial_changeset()).unwrap();
-    /// assert_eq!(graph.tip().block_id(), other.tip().block_id());
-    /// assert!(!effective.is_empty());
-    ///
-    /// // Applying it a second time changes nothing.
-    /// assert!(graph.apply_changeset(other.initial_changeset()).unwrap().is_empty());
-    /// ```
     pub fn apply_changeset(
         &mut self,
         changeset: ChangeSet<T>,
@@ -640,9 +613,10 @@ impl<T: Block + PartialEq + Debug + Clone> BlockGraph<T> {
     /// with [`ApplyChangeSetError::ConnectBlock`]`(`[`ConnectBlockError::HeightZeroReservedForRoot`]`)`.
     /// This graph is left unchanged if an error is returned.
     ///
-    /// # Examples
+    /// # Example
     ///
     /// ```
+    /// use bitcoin::hashes::Hash;
     /// use bitcoin::{constants, Network};
     /// use block_graph::BlockGraph;
     ///
@@ -650,10 +624,14 @@ impl<T: Block + PartialEq + Debug + Clone> BlockGraph<T> {
     /// let mut graph = BlockGraph::from_genesis(genesis);
     ///
     /// let mut other = BlockGraph::from_genesis(genesis);
-    /// let block_1 = bitcoin::block::Header {
-    ///     prev_blockhash: other.tip().hash(),
-    ///     ..genesis
-    /// };
+    /// # let block_1 = bitcoin::block::Header {
+    /// #     version: bitcoin::block::Version::default(),
+    /// #     prev_blockhash: other.tip().hash(),
+    /// #     merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+    /// #     time: 1234567,
+    /// #     bits: bitcoin::pow::Target::MAX_ATTAINABLE_REGTEST.to_compact_lossy(),
+    /// #     nonce: 0,
+    /// # };
     /// let update = other.tip().push(1, block_1).unwrap();
     /// other.apply_update(update).unwrap();
     ///
