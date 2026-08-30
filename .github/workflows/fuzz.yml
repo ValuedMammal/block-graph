@@ -82,6 +82,7 @@ jobs:
           - connect_block
           - apply_update
           - checkpoint_ops
+          - merge
     steps:
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1
