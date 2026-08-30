@@ -301,6 +301,10 @@ impl<T: Block + PartialEq + Debug + Clone> BlockGraph<T> {
     ///   since intermediate blocks are legitimately absent from the graph; likewise, values
     ///   that don't declare a `prev_blockhash` (see [`Block`]) are never rejected
     ///   on this basis.
+    /// - If `value` is being connected for the first time and some already-connected block
+    ///   already names its hash as a parent, but committing it at `height` would put it at or
+    ///   above that child, or would turn a previously gapped edge into an adjacent one the
+    ///   child's declared `prev_blockhash` contradicts.
     pub fn connect_block(
         &mut self,
         height: u32,
@@ -313,7 +317,7 @@ impl<T: Block + PartialEq + Debug + Clone> BlockGraph<T> {
             let existing_height = self.blocks.get(&hash).map(|(h, _)| *h);
             check_height_unchanged(hash, height, existing_height)?;
             if existing_height.is_none() {
-                self.check_no_child_height_violation(hash, height)?;
+                self.check_no_child_violation(hash, height)?;
             }
             let parent_height = self_parent_height(
                 hash,
@@ -343,19 +347,29 @@ impl<T: Block + PartialEq + Debug + Clone> BlockGraph<T> {
 
     /// `hash` may already be recorded as some other block's declared parent via `next_hashes`
     /// (a gapped connection can reference a parent hash before that parent is ever connected as
-    /// an actual block). If so, connecting `hash` for the first time at `height` must not
-    /// retroactively put it at or above one of those already-connected children — otherwise the
-    /// parent/child height invariant would be violated the moment `hash` gets a committed
-    /// height. Only relevant the first time `hash` is connected, since its height can never
-    /// change afterward (see [`check_height_unchanged`]).
-    fn check_no_child_height_violation(
+    /// an actual block). Committing `hash` at `height` retroactively fixes the shape of each of
+    /// those edges, so both parent/child invariants have to be re-checked against the children
+    /// that are already connected:
+    ///
+    /// - `height` must be strictly below every such child's height, or the parent/child height
+    ///   invariant would be violated the moment `hash` gets a committed height.
+    /// - an edge that was *gapped* when it was recorded becomes *adjacent* if a child sits at
+    ///   `height + 1`, which brings it under [`check_prev_blockhash`]'s rule for the first time.
+    ///   Without this, a child whose declared `prev_blockhash` names some other block keeps an
+    ///   adjacent edge that contradicts it; `canonicalize` then hands `CheckPoint::insert` a
+    ///   chain it refuses to link, and the displaced checkpoint leaves the tip chain with an
+    ///   adjacent pair that has no recorded edge (`check_invariants` #6).
+    ///
+    /// Only relevant the first time `hash` is connected, since its height can never change
+    /// afterward (see [`check_height_unchanged`]).
+    fn check_no_child_violation(
         &self,
         hash: BlockHash,
         height: u32,
     ) -> Result<(), ConnectBlockError> {
         if let Some(children) = self.next_hashes.get(&hash) {
             for &child_hash in children {
-                if let Some((child_height, _)) = self.blocks.get(&child_hash) {
+                if let Some((child_height, child_value)) = self.blocks.get(&child_hash) {
                     if height >= *child_height {
                         return Err(ConnectBlockError::ChildHeightNotGreater {
                             hash,
@@ -363,6 +377,11 @@ impl<T: Block + PartialEq + Debug + Clone> BlockGraph<T> {
                             child_hash,
                             child_height: *child_height,
                         });
+                    }
+                    if *child_height == height.saturating_add(1)
+                        && child_value.prev_blockhash().is_some_and(|prev| prev != hash)
+                    {
+                        return Err(ConnectBlockError::PrevBlockhashMismatch);
                     }
                 }
             }
@@ -439,7 +458,7 @@ impl<T: Block + PartialEq + Debug + Clone> BlockGraph<T> {
                     .or_else(|| self.blocks.get(&hash).map(|(h, _)| *h));
                 check_height_unchanged(hash, block_id.height, existing_height)?;
                 if existing_height.is_none() {
-                    self.check_no_child_height_violation(hash, block_id.height)?;
+                    self.check_no_child_violation(hash, block_id.height)?;
                 }
                 let parent_height = staged
                     .get(prev_hash)
@@ -718,7 +737,7 @@ impl<T: Block + PartialEq + Debug + Clone> BlockGraph<T> {
             let existing_height = self.blocks.get(&hash).map(|(h, _)| *h);
             check_height_unchanged(hash, *height, existing_height)?;
             if existing_height.is_none() {
-                self.check_no_child_height_violation(hash, *height)?;
+                self.check_no_child_violation(hash, *height)?;
             }
         }
 
@@ -3246,5 +3265,64 @@ mod test {
             "child's parents entry should be backfilled once the parent becomes known"
         );
         assert_eq!(graph.tip().block_id(), (5, child.block_hash()).into());
+    }
+
+    #[test]
+    fn connect_block_rejects_a_retroactively_adjacent_prev_blockhash_mismatch() {
+        // Regression test: connecting a block under an as-yet-unknown parent hash skips the
+        // adjacency check (the parent has no height yet, so the edge is treated as gapped). If
+        // that parent is later connected one height below the child, the edge becomes adjacent
+        // and must satisfy the child's declared `prev_blockhash` — otherwise `canonicalize`
+        // produces a chain `CheckPoint::insert` refuses to link, the parent is displaced, and the
+        // tip chain ends up with an adjacent pair that has no recorded edge.
+        let genesis = genesis_header();
+        let mut graph = BlockGraph::from_genesis(genesis);
+
+        let x = header(genesis.block_hash(), Some(1));
+        let x_hash = x.block_hash();
+        // `c` declares genesis as its parent, but is connected under `x_hash` while `x` is still
+        // unknown to the graph, so nothing contradicts it yet.
+        let c = header(genesis.block_hash(), Some(2));
+        graph.connect_block(2, c, x_hash).unwrap();
+
+        // Committing `x` at height 1 would make the recorded `x -> c` edge adjacent.
+        let before = graph.clone();
+        assert_eq!(
+            graph.connect_block(1, x, genesis.block_hash()),
+            Err(ConnectBlockError::PrevBlockhashMismatch),
+        );
+        assert_eq!(graph, before, "a rejected connection must not mutate the graph");
+
+        // The same block is still connectable anywhere the edge stays gapped.
+        graph.connect_block(0, genesis, BlockHash::all_zeros()).unwrap();
+        graph.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn apply_changeset_rejects_a_retroactively_adjacent_prev_blockhash_mismatch() {
+        // Same hazard as `connect_block_rejects_a_retroactively_adjacent_prev_blockhash_mismatch`,
+        // reached through the changeset path: the block that closes the gap arrives in a
+        // changeset rather than via `connect_block`.
+        let genesis = genesis_header();
+        let mut graph = BlockGraph::from_genesis(genesis);
+
+        let x = header(genesis.block_hash(), Some(1));
+        let x_hash = x.block_hash();
+        let c = header(genesis.block_hash(), Some(2));
+        graph.connect_block(2, c, x_hash).unwrap();
+
+        let changeset = ChangeSet {
+            blocks: [(x_hash, (1u32, x))].into(),
+            edges: [(genesis.block_hash(), x_hash)].into(),
+        };
+
+        let before = graph.clone();
+        assert_eq!(
+            graph.apply_changeset(changeset),
+            Err(ApplyChangeSetError::ConnectBlock(
+                ConnectBlockError::PrevBlockhashMismatch
+            )),
+        );
+        assert_eq!(graph, before, "a rejected changeset must not mutate the graph");
     }
 }
