@@ -18,6 +18,10 @@ Statistically it's more performant (due to having a stack of linked lists enabli
 
 The skiplist isn't a hard requirement of BlockGraph, per se, but the attractive performance profile may help to facilitate adoption.
 
+**Why does merging two graphs just recompute the tip instead of splicing the two chains?**
+
+`apply_changeset`/`apply_graph_update` treat a merge as a union of blocks and edges over a *shared root*, not a splice of two tip chains: both graphs must already agree on genesis, everything `other` knows is folded into `self`'s blocks and edges, and the canonical tip is then fully recomputed from scratch over the result — the same longest-chain-by-height rule `canonicalize` always uses. Because the graph is append-only, nothing `self` already had is ever lost: if `other`'s branch turns out to be better, the tip moves there, but `self`'s previous branch stays in the graph and queryable. Recomputing rather than splicing is also what makes the merge commutative and idempotent — the result depends only on the union of the two graphs' data, not on the order they were combined in or how many times a given update is replayed, which matters for a persistence layer that may see the same changeset more than once.
+
 **Alternatives**
 
 Some alternatives have been considered for implementing a skiplist, discussed here
