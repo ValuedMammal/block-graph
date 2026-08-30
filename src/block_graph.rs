@@ -99,33 +99,19 @@ impl<T: Block + PartialEq + Debug + Clone> BlockGraph<T> {
 
     /// Construct a [`BlockGraph`] from a [`ChangeSet`]. Returns `None` if `changeset` is empty.
     ///
-    /// This method rebuilds the block graph from a changeset by:
-    ///
-    /// 1. Finding the genesis block (height 0)
-    /// 2. Building the graph structure with parent-child relationships
-    /// 3. Determining the canonical chain tip
-    /// 4. Constructing the canonical chain by traversing back from the tip
+    /// This is the empty-graph case of [`apply_changeset`](Self::apply_changeset): the changeset's
+    /// genesis block anchors a new graph, and the rest is applied to it, so both entry points
+    /// enforce exactly the same rules on changeset data.
     ///
     /// # Errors
     ///
     /// Returns [`FromChangeSetError::MissingGenesis`] if no block at height 0 exists in the
     /// changeset, [`FromChangeSetError::MultipleGenesisBlocks`] if more than one distinct block
-    /// is declared at height 0, [`FromChangeSetError::BlockHashMismatch`] if a block's value
-    /// doesn't hash to the key it's recorded under, [`FromChangeSetError::InvalidEdgeHeight`] if
-    /// an edge's declared parent (when present in `changeset.blocks`) is not at a strictly lower
-    /// height than its child, or [`FromChangeSetError::InconsistentPrevBlockhash`] if an adjacent
-    /// pair in the reconstructed chain declares a `prev_blockhash` that doesn't match its parent.
+    /// is declared at height 0, or [`FromChangeSetError::Apply`] wrapping whatever
+    /// `apply_changeset` rejects the remaining blocks and edges for.
     pub fn from_changeset(changeset: ChangeSet<T>) -> Result<Option<Self>, FromChangeSetError> {
         if changeset.blocks.is_empty() {
             return Ok(None);
-        }
-        for (&hash, (_, value)) in &changeset.blocks {
-            if value.to_blockhash() != hash {
-                return Err(FromChangeSetError::BlockHashMismatch {
-                    hash,
-                    computed: value.to_blockhash(),
-                });
-            }
         }
         let mut genesis_blocks = changeset.blocks.iter().filter(|(_, (height, _))| *height == 0);
         let (&genesis_hash, (_, genesis_value)) =
@@ -137,36 +123,11 @@ impl<T: Block + PartialEq + Debug + Clone> BlockGraph<T> {
             });
         }
 
-        check_changeset_edge_heights(&changeset)?;
-
+        // A genesis value that doesn't hash to `genesis_hash` would anchor the graph at the wrong
+        // root; `apply_changeset`'s hash-integrity check rejects it below, and the half-built
+        // graph is dropped with it.
         let mut graph = Self::from_genesis(genesis_value.clone());
-
-        // Populate blocks from changeset blocks
-        for (&hash, (height, value)) in &changeset.blocks {
-            graph.blocks.insert(hash, (*height, value.clone()));
-        }
-
-        // Populate next_hashes and parents from changeset edges. An edge's parent may
-        // legitimately be a hash with no block data (e.g. the sentinel predecessor of genesis,
-        // or a gapped connection's declared-but-absent parent), but a child with no block data
-        // describes no real relationship, so such edges are dropped entirely rather than left
-        // dangling in `next_hashes`/`parents`.
-        for &(parent_hash, child_hash) in &changeset.edges {
-            if !graph.blocks.contains_key(&child_hash) {
-                continue;
-            }
-            graph.next_hashes.entry(parent_hash).or_default().insert(child_hash);
-            if let Some(parent_id) = graph.block_id(&parent_hash) {
-                graph.parents.entry(child_hash).or_default().insert(parent_id);
-            }
-        }
-
-        let items = graph.canonicalize(graph.root);
-        graph.tip = graph.tip.extend(items).map_err(|err| {
-            FromChangeSetError::InconsistentPrevBlockhash {
-                hash: err.value.to_blockhash(),
-            }
-        })?;
+        graph.apply_changeset(changeset)?;
 
         Ok(Some(graph))
     }
@@ -709,11 +670,11 @@ impl<T: Block + PartialEq + Debug + Clone> BlockGraph<T> {
     /// Validate every block and edge of `changeset` against this graph *and* against the rest of
     /// `changeset`, without mutating anything.
     ///
-    /// This is the [`validate_connections`](Self::validate_connections) analogue for changesets.
-    /// The distinction that matters: [`check_changeset_edge_heights`] only ever consults
-    /// `changeset.blocks`, which is sufficient when building a graph from nothing but blind to
-    /// every conflict *between* `changeset` and an existing graph, so heights here are resolved
-    /// over the union of the two.
+    /// This is the [`validate_connections`](Self::validate_connections) analogue for changesets,
+    /// and the single validation pass behind both [`apply_changeset`](Self::apply_changeset) and
+    /// [`from_changeset`](Self::from_changeset). Heights are resolved over the *union* of the
+    /// graph and the changeset: resolving them from `changeset.blocks` alone is enough when
+    /// building a graph from nothing, but blind to every conflict *between* the two.
     fn validate_changeset(&self, changeset: &ChangeSet<T>) -> Result<(), ApplyChangeSetError> {
         // Heights as they will be once `changeset` is applied: it can't change a height already
         // recorded here (`check_height_unchanged` below rejects that), so either source works for
@@ -753,9 +714,24 @@ impl<T: Block + PartialEq + Debug + Clone> BlockGraph<T> {
                 child_height,
                 resolved_height(&parent_hash),
             );
-            check_parent_height(child_height, parent_height)?;
-            // Unlike `from_changeset` — which only surfaces this lazily, and only for the chain it
-            // happens to canonicalize — every edge is checked here, non-canonical branches too.
+            // Rejecting backwards edges up front also rules out cycles, since any cycle must
+            // contain at least one edge whose parent height doesn't decrease.
+            if let Some(parent_height) = parent_height {
+                if parent_height >= child_height {
+                    return Err(ApplyChangeSetError::InvalidEdgeHeight {
+                        parent: BlockId {
+                            height: parent_height,
+                            hash: parent_hash,
+                        },
+                        child: BlockId {
+                            height: child_height,
+                            hash: child_hash,
+                        },
+                    });
+                }
+            }
+            // Every edge is checked, non-canonical branches included — not just the chain that
+            // happens to canonicalize.
             if let Some((_, value)) = changeset
                 .blocks
                 .get(&child_hash)
@@ -1115,31 +1091,8 @@ pub enum FromChangeSetError {
         /// A second, distinct height-0 block found in the same changeset.
         second: BlockHash,
     },
-    /// A block's value doesn't hash to the key it's recorded under, so the changeset describes a
-    /// block that cannot exist.
-    BlockHashMismatch {
-        /// The hash the block is keyed by in the changeset.
-        hash: BlockHash,
-        /// The hash the block's value actually computes to.
-        computed: BlockHash,
-    },
-    /// An edge's declared parent is not at a strictly lower height than its child, which would
-    /// otherwise allow cyclic or backwards-height data into the graph.
-    InvalidEdgeHeight {
-        /// The edge's declared parent.
-        parent: BlockId,
-        /// The edge's declared child.
-        child: BlockId,
-    },
-    /// An adjacent pair of blocks in the reconstructed canonical chain declares a
-    /// `prev_blockhash` (see [`Block`]) that doesn't match its recorded parent. Unlike
-    /// [`connect_block`](BlockGraph::connect_block)/[`apply_update`](BlockGraph::apply_update),
-    /// `from_changeset` populates the graph directly from possibly-adversarial data, so this
-    /// inconsistency isn't caught until the tip chain is rebuilt.
-    InconsistentPrevBlockhash {
-        /// The block whose declared `prev_blockhash` doesn't match its recorded parent.
-        hash: BlockHash,
-    },
+    /// The changeset's blocks and edges could not be applied to the graph its genesis anchors.
+    Apply(ApplyChangeSetError),
 }
 
 impl Display for FromChangeSetError {
@@ -1150,51 +1103,17 @@ impl Display for FromChangeSetError {
                 f,
                 "changeset declares more than one block at height 0: {first} and {second}"
             ),
-            Self::BlockHashMismatch { hash, computed } => write!(
-                f,
-                "changeset records a block under {hash}, but its value hashes to {computed}",
-            ),
-            Self::InvalidEdgeHeight { parent, child } => write!(
-                f,
-                "edge parent {parent:?} is not at a strictly lower height than child {child:?}"
-            ),
-            Self::InconsistentPrevBlockhash { hash } => write!(
-                f,
-                "block {hash} declares a prev_blockhash that doesn't match its recorded parent"
-            ),
+            Self::Apply(e) => write!(f, "{e}"),
         }
     }
 }
 
 impl core::error::Error for FromChangeSetError {}
 
-/// Check that every edge in `changeset` whose parent and child both appear in
-/// `changeset.blocks` has a parent height strictly less than the child's height.
-///
-/// This is the same rule [`check_parent_height`] enforces on [`connect_block`](BlockGraph::connect_block)
-/// and [`apply_update`](BlockGraph::apply_update), applied to raw changeset data before it's trusted
-/// to build a [`BlockGraph`]. Rejecting these edges up front also rules out cycles (since any
-/// cycle must contain at least one edge whose parent height doesn't decrease).
-fn check_changeset_edge_heights<T>(changeset: &ChangeSet<T>) -> Result<(), FromChangeSetError> {
-    for &(parent_hash, child_hash) in &changeset.edges {
-        let parent_height = changeset.blocks.get(&parent_hash).map(|(height, _)| *height);
-        let child_height = changeset.blocks.get(&child_hash).map(|(height, _)| *height);
-        if let (Some(parent_height), Some(child_height)) = (parent_height, child_height) {
-            if parent_height >= child_height {
-                return Err(FromChangeSetError::InvalidEdgeHeight {
-                    parent: BlockId {
-                        height: parent_height,
-                        hash: parent_hash,
-                    },
-                    child: BlockId {
-                        height: child_height,
-                        hash: child_hash,
-                    },
-                });
-            }
-        }
+impl From<ApplyChangeSetError> for FromChangeSetError {
+    fn from(e: ApplyChangeSetError) -> Self {
+        Self::Apply(e)
     }
-    Ok(())
 }
 
 /// The parent of a block must exist at a strictly lower height than the block itself.
@@ -1394,6 +1313,16 @@ pub enum ApplyChangeSetError {
         /// The hash the block's value actually computes to.
         computed: BlockHash,
     },
+    /// An edge's declared parent is not at a strictly lower height than its child, which would
+    /// otherwise allow cyclic or backwards-height data into the graph. Heights are resolved over
+    /// the union of the graph and the changeset, so this fires on an edge that only conflicts
+    /// once the two are combined.
+    InvalidEdgeHeight {
+        /// The edge's declared parent.
+        parent: BlockId,
+        /// The edge's declared child.
+        child: BlockId,
+    },
     /// A block or edge in the changeset is inconsistent with this graph or with the rest of the
     /// changeset. This covers the same rules [`connect_block`](BlockGraph::connect_block)
     /// enforces — height conflicts, a foreign genesis, backwards or cyclic edges, and
@@ -1407,6 +1336,10 @@ impl Display for ApplyChangeSetError {
             Self::BlockHashMismatch { hash, computed } => write!(
                 f,
                 "changeset records a block under {hash}, but its value hashes to {computed}",
+            ),
+            Self::InvalidEdgeHeight { parent, child } => write!(
+                f,
+                "edge parent {parent:?} is not at a strictly lower height than child {child:?}"
             ),
             Self::ConnectBlock(e) => write!(f, "{e}"),
         }
@@ -2796,7 +2729,7 @@ mod test {
     // sent it into an infinite loop. Adding the visited-set fixed the hang, but a purely cyclic
     // graph then had no leaf at all, turning the hang into a panic in `canonicalize`. Changeset
     // edges are now validated for strictly-increasing parent/child height before the graph is
-    // built (`check_changeset_edge_heights`), which rejects cycles outright — the only paths
+    // built (`validate_changeset`), which rejects cycles outright — the only paths
     // that could otherwise introduce a cycle, since `connect_block`/`apply_update` already
     // enforce strictly-increasing parent height on every insertion.
 
@@ -2863,7 +2796,7 @@ mod test {
         // every edge is validated, not just the ones the tip-selection BFS happens to reach.
         assert_eq!(
             BlockGraph::from_changeset(changeset),
-            Err(FromChangeSetError::InvalidEdgeHeight {
+            Err(FromChangeSetError::Apply(ApplyChangeSetError::InvalidEdgeHeight {
                 parent: BlockId {
                     height: 2,
                     hash: h_y
@@ -2872,7 +2805,7 @@ mod test {
                     height: 1,
                     hash: h_x
                 },
-            }),
+            })),
         );
     }
 
@@ -2911,10 +2844,10 @@ mod test {
 
         assert_eq!(
             BlockGraph::from_changeset(changeset),
-            Err(FromChangeSetError::InvalidEdgeHeight {
+            Err(FromChangeSetError::Apply(ApplyChangeSetError::InvalidEdgeHeight {
                 parent: BlockId { height: 0, hash: g },
                 child: BlockId { height: 0, hash: g },
-            }),
+            })),
         );
     }
 
@@ -2932,7 +2865,7 @@ mod test {
 
         assert_eq!(
             BlockGraph::from_changeset(changeset),
-            Err(FromChangeSetError::InvalidEdgeHeight {
+            Err(FromChangeSetError::Apply(ApplyChangeSetError::InvalidEdgeHeight {
                 parent: BlockId {
                     height: 2,
                     hash: h2
@@ -2941,7 +2874,7 @@ mod test {
                     height: 1,
                     hash: h1
                 },
-            }),
+            })),
         );
     }
 
@@ -2978,10 +2911,10 @@ mod test {
 
         assert_eq!(
             BlockGraph::from_changeset(changeset),
-            Err(FromChangeSetError::BlockHashMismatch {
+            Err(FromChangeSetError::Apply(ApplyChangeSetError::BlockHashMismatch {
                 hash: bogus,
                 computed: g,
-            }),
+            })),
         );
     }
 
@@ -3099,9 +3032,9 @@ mod test {
 
     #[test]
     fn apply_changeset_rejects_an_edge_that_goes_backwards_against_the_graph() {
-        // The parent lives in `self.blocks` and the child in `changeset.blocks`, so
-        // `check_changeset_edge_heights` — which only ever consults `changeset.blocks` — is blind
-        // to it. Heights must be resolved over the union of the graph and the changeset.
+        // The parent lives in `self.blocks` and the child in `changeset.blocks`, so the changeset
+        // is self-consistent in isolation — only the union of the two reveals the violation, which
+        // is why heights are resolved over both.
         let (mut graph, headers) = graph_with_branch(2, 1);
         let h2 = headers[1]; // height 2, known to the graph but absent from the changeset
 
@@ -3110,18 +3043,25 @@ mod test {
             blocks: [(fork.block_hash(), (1u32, fork))].into(),
             edges: [(h2.block_hash(), fork.block_hash())].into(),
         };
-        assert_eq!(
-            check_changeset_edge_heights(&changeset),
-            Ok(()),
-            "the changeset alone looks fine; only the graph reveals the violation"
-        );
+        // A graph that has never heard of `h2` treats the edge as a gapped connection to an
+        // unknown parent and accepts the very same changeset.
+        BlockGraph::from_genesis(genesis_header())
+            .apply_changeset(changeset.clone())
+            .expect("the changeset alone is consistent; only the graph reveals the violation");
 
         let before = graph.clone();
         assert_eq!(
             graph.apply_changeset(changeset),
-            Err(ApplyChangeSetError::ConnectBlock(
-                ConnectBlockError::ParentHeightNotSmaller
-            )),
+            Err(ApplyChangeSetError::InvalidEdgeHeight {
+                parent: BlockId {
+                    height: 2,
+                    hash: h2.block_hash()
+                },
+                child: BlockId {
+                    height: 1,
+                    hash: fork.block_hash()
+                },
+            }),
         );
         assert_eq!(graph, before, "a rejected changeset must not mutate the graph");
     }
@@ -3160,10 +3100,10 @@ mod test {
     }
 
     #[test]
-    fn apply_changeset_rejects_a_prev_blockhash_mismatch_on_a_non_canonical_branch() {
-        // `apply_changeset` validates every edge, so a broken adjacent link is caught even on a
-        // branch that never gets canonicalized. `from_changeset` only checks the chain it
-        // rebuilds, so it accepts the very same data — asserted here to pin the difference.
+    fn both_changeset_paths_reject_a_prev_blockhash_mismatch_on_a_non_canonical_branch() {
+        // A broken adjacent link is caught even on a branch that never gets canonicalized, and
+        // identically through both entry points — pinned here because the natural shortcut of
+        // validating via the rebuilt tip chain would silently miss it.
         let genesis = genesis_header();
         let a1 = header(genesis.block_hash(), Some(1));
         let a2 = header(a1.block_hash(), Some(2));
@@ -3193,9 +3133,15 @@ mod test {
             .into(),
         };
 
-        // The canonical chain is a1..a3, so `from_changeset` never inspects the b1 -> c2 edge.
-        let rebuilt = BlockGraph::from_changeset(changeset.clone()).unwrap().unwrap();
-        assert_eq!(rebuilt.tip().block_id(), (3, a3.block_hash()).into());
+        // The canonical chain is a1..a3, so validating only the chain that gets canonicalized
+        // would never inspect the b1 -> c2 edge. Both entry points share `validate_changeset`,
+        // which walks every edge, so both reject it.
+        assert_eq!(
+            BlockGraph::from_changeset(changeset.clone()),
+            Err(FromChangeSetError::Apply(ApplyChangeSetError::ConnectBlock(
+                ConnectBlockError::PrevBlockhashMismatch
+            ))),
+        );
 
         let mut graph = BlockGraph::from_genesis(genesis);
         let before = graph.clone();
@@ -3324,5 +3270,27 @@ mod test {
             )),
         );
         assert_eq!(graph, before, "a rejected changeset must not mutate the graph");
+    }
+
+    #[test]
+    fn from_changeset_and_apply_changeset_agree() {
+        // The point of routing `from_changeset` through `apply_changeset`: loading the same
+        // persisted bytes two different ways must not give two different answers.
+        let genesis = genesis_header();
+        let (mut graph, headers) = graph_with_branch(3, 1);
+        // A fork off height 1, so the graph carries a non-canonical branch too.
+        let fork = header(headers[0].block_hash(), Some(50));
+        graph.connect_block(2, fork, headers[0].block_hash()).unwrap();
+        let changeset = graph.initial_changeset();
+
+        let rebuilt = BlockGraph::from_changeset(changeset.clone()).unwrap().unwrap();
+
+        let mut applied = BlockGraph::from_genesis(genesis);
+        applied.apply_changeset(changeset).unwrap();
+
+        assert_eq!(rebuilt, applied, "both load paths must produce the same graph");
+        assert_eq!(rebuilt, graph, "and it must round-trip back to the original");
+        rebuilt.check_invariants().unwrap();
+        rebuilt.check_best_tip().unwrap();
     }
 }
