@@ -60,11 +60,9 @@ fuzz_target!(|scenarios: (Scenario, Scenario, Scenario)| {
 
     // Associativity-flavored check across three graphs: (a ∪ b) ∪ c vs (a ∪ c) ∪ b.
     let mut abc = graph_a.clone();
-    let abc_ok =
-        abc.apply_block_graph(&graph_b).is_ok() && abc.apply_block_graph(&graph_c).is_ok();
+    let abc_ok = abc.apply_block_graph(&graph_b).is_ok() && abc.apply_block_graph(&graph_c).is_ok();
     let mut acb = graph_a.clone();
-    let acb_ok =
-        acb.apply_block_graph(&graph_c).is_ok() && acb.apply_block_graph(&graph_b).is_ok();
+    let acb_ok = acb.apply_block_graph(&graph_c).is_ok() && acb.apply_block_graph(&graph_b).is_ok();
     if abc_ok && acb_ok {
         assert_eq!(
             abc, acb,
