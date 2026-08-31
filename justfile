@@ -77,9 +77,7 @@ bench:
 
 # Build all fuzz targets
 fuzz-build:
-    cd fuzz
-    cargo +{{nightly}} fmt
-    cargo +{{nightly}} fuzz build
+    cd fuzz && cargo +{{nightly}} fmt && cargo +{{nightly}} fuzz build
 
 # Run a fuzz target, e.g. `just fuzz apply_update 60`
 fuzz target="from_changeset" secs="30":
