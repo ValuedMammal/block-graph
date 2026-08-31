@@ -635,13 +635,10 @@ impl<T: Block + PartialEq + Debug + Clone> BlockGraph<T> {
     /// let update = other.tip().push(1, block_1).unwrap();
     /// other.apply_update(update).unwrap();
     ///
-    /// graph.apply_graph_update(&other).unwrap();
+    /// graph.apply_block_graph(&other).unwrap();
     /// assert_eq!(graph.tip().block_id(), other.tip().block_id());
     /// ```
-    pub fn apply_graph_update(
-        &mut self,
-        other: &Self,
-    ) -> Result<ChangeSet<T>, ApplyChangeSetError> {
+    pub fn apply_block_graph(&mut self, other: &Self) -> Result<ChangeSet<T>, ApplyChangeSetError> {
         self.apply_changeset(other.initial_changeset())
     }
 
@@ -1280,7 +1277,7 @@ impl From<ConnectBlockError> for ApplyUpdateError {
     }
 }
 
-/// Error returned by [`BlockGraph::apply_changeset`] and [`BlockGraph::apply_graph_update`].
+/// Error returned by [`BlockGraph::apply_changeset`] and [`BlockGraph::apply_block_graph`].
 #[derive(Debug, PartialEq)]
 pub enum ApplyChangeSetError {
     /// A block's value doesn't hash to the key it's recorded under, so the changeset describes a
@@ -2928,13 +2925,13 @@ mod test {
     }
 
     #[test]
-    fn apply_graph_update_reorgs_and_keeps_the_old_branch() {
+    fn apply_block_graph_reorgs_and_keeps_the_old_branch() {
         // Merging in a taller branch must move the tip, but the graph is append-only, so the
         // branch it displaced has to remain queryable.
         let (mut graph, short) = graph_with_branch(2, 1);
         let (tall, long) = graph_with_branch(3, 101);
 
-        graph.apply_graph_update(&tall).unwrap();
+        graph.apply_block_graph(&tall).unwrap();
         graph.check_invariants().unwrap();
         graph.check_best_tip().unwrap();
 
@@ -2949,16 +2946,16 @@ mod test {
     }
 
     #[test]
-    fn apply_graph_update_is_commutative() {
+    fn apply_block_graph_is_commutative() {
         // Merging is a union of blocks and edges with the tip recomputed over the result, so the
         // order the two graphs are merged in must not matter.
         let (a, _) = graph_with_branch(2, 1);
         let (b, _) = graph_with_branch(3, 101);
 
         let mut ab = a.clone();
-        ab.apply_graph_update(&b).unwrap();
+        ab.apply_block_graph(&b).unwrap();
         let mut ba = b.clone();
-        ba.apply_graph_update(&a).unwrap();
+        ba.apply_block_graph(&a).unwrap();
 
         assert_eq!(ab, ba);
         ab.check_invariants().unwrap();
@@ -2975,7 +2972,7 @@ mod test {
 
         let before = graph.clone();
         assert_eq!(
-            graph.apply_graph_update(&other),
+            graph.apply_block_graph(&other),
             Err(ApplyChangeSetError::ConnectBlock(
                 ConnectBlockError::HeightZeroReservedForRoot {
                     hash: foreign.block_hash(),
