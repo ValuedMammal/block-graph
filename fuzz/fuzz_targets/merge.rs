@@ -1,7 +1,7 @@
 #![no_main]
 
 use bitcoin::BlockHash;
-use block_graph::BlockGraph;
+use block_graph::{BlockGraph, ChangeSet};
 use block_graph_fuzz::{Harness, Scenario};
 use libfuzzer_sys::fuzz_target;
 
@@ -19,6 +19,18 @@ fn build_graph(scenario: &Scenario) -> BlockGraph<BlockHash> {
         let _ = harness.graph.apply_update(cp);
     }
     harness.graph
+}
+
+/// `false` if `a` and `b` bind any shared hash to two different heights.
+///
+/// `ChangeSet::merge` is append-only/first-write-wins: it's only a commutative, associative,
+/// apply-order-independent union on compatible input. On incompatible input it resolves silently
+/// toward `self`, and its `debug_assert` would fire (the fuzz profile builds with
+/// `-Cdebug-assertions`) — so every changeset-level law below is guarded by this.
+fn compatible(a: &ChangeSet<BlockHash>, b: &ChangeSet<BlockHash>) -> bool {
+    a.blocks
+        .iter()
+        .all(|(hash, (height, _))| b.blocks.get(hash).is_none_or(|(h, _)| h == height))
 }
 
 fuzz_target!(|scenarios: (Scenario, Scenario, Scenario)| {
@@ -70,5 +82,68 @@ fuzz_target!(|scenarios: (Scenario, Scenario, Scenario)| {
         );
         block_graph_fuzz::assert_ok(abc.check_invariants(), &ctx);
         block_graph_fuzz::assert_ok(abc.check_best_tip(), &ctx);
+    }
+
+    // --- Changeset-level laws (`ChangeSet::merge`), guarded by `compatible` ---
+    let a = graph_a.initial_changeset();
+    let b = graph_b.initial_changeset();
+    let c = graph_c.initial_changeset();
+
+    if compatible(&a, &b) {
+        let mut ab = a.clone();
+        ab.merge(b.clone());
+        let mut ba = b.clone();
+        ba.merge(a.clone());
+        assert_eq!(
+            ab, ba,
+            "changeset merge should be commutative on compatible input\ncontext: {ctx}"
+        );
+
+        let mut ab_again = ab.clone();
+        ab_again.merge(b.clone());
+        assert_eq!(
+            ab_again, ab,
+            "repeating a changeset merge should be idempotent\ncontext: {ctx}"
+        );
+
+        // Homomorphism: `from_changeset(a.merge(b))` must agree with `from_changeset(a)` followed
+        // by `apply_changeset(b)`, both on success/failure and on the resulting graph. `a` is a
+        // real graph's own changeset, so it's never empty and always loads.
+        let mut sequential = BlockGraph::from_changeset(a.clone())
+            .expect("a real graph's own changeset must load")
+            .expect("a real graph's changeset is never empty");
+        let sequential_ok = sequential.apply_changeset(b.clone()).is_ok();
+
+        let merged = BlockGraph::from_changeset(ab.clone());
+        let merged_ok = matches!(merged, Ok(Some(_)));
+
+        assert_eq!(
+            merged_ok, sequential_ok,
+            "merged-union and sequential application should agree on success/failure on \
+             compatible input\ncontext: {ctx}"
+        );
+        if let Ok(Some(merged_graph)) = merged {
+            if sequential_ok {
+                assert_eq!(
+                    merged_graph, sequential,
+                    "merging then loading should agree with sequential application\ncontext: {ctx}"
+                );
+                block_graph_fuzz::assert_ok(merged_graph.check_invariants(), &ctx);
+                block_graph_fuzz::assert_ok(merged_graph.check_best_tip(), &ctx);
+            }
+        }
+    }
+
+    if compatible(&a, &b) && compatible(&a, &c) && compatible(&b, &c) {
+        let mut abc = a.clone();
+        abc.merge(b.clone());
+        abc.merge(c.clone());
+        let mut acb = a.clone();
+        acb.merge(c.clone());
+        acb.merge(b.clone());
+        assert_eq!(
+            abc, acb,
+            "changeset merge should be associative on compatible input\ncontext: {ctx}"
+        );
     }
 });
