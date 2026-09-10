@@ -22,6 +22,28 @@ The skiplist isn't a hard requirement of BlockGraph, per se, but the attractive 
 
 `apply_changeset`/`apply_block_graph` treat a merge as a union of blocks and edges over a *shared root*, not a splice of two tip chains: both graphs must already agree on genesis, everything `other` knows is folded into `self`'s blocks and edges, and the canonical tip is then fully recomputed from scratch over the result — the same longest-chain-by-height rule `canonicalize` always uses. Because the graph is append-only, nothing `self` already had is ever lost: if `other`'s branch turns out to be better, the tip moves there, but `self`'s previous branch stays in the graph and queryable. Recomputing rather than splicing is also what makes the merge commutative and idempotent — the result depends only on the union of the two graphs' data, not on the order they were combined in or how many times a given update is replayed, which matters for a persistence layer that may see the same changeset more than once.
 
+**What does `ChangeSet::merge` guarantee, and why isn't it a plain union?**
+
+`ChangeSet::merge` (used to fold two changesets together, e.g. before persisting) is
+append-only/first-write-wins on `blocks`: if a hash is already recorded in `self`, its
+`(height, value)` is kept and the incoming entry is skipped, rather than the last-write-wins
+overwrite a plain `BTreeMap::extend` would do. `edges` are still a plain set union. Changesets
+descending from a common `BlockGraph` lineage never disagree on the height of a shared hash, so in
+practice `merge` behaves like a true union — it only diverges when handed changesets from unrelated
+sources that stake conflicting claims about the same block.
+
+The compatibility precondition — no shared hash bound to two different heights — is what makes
+`merge` commutative, idempotent, and associative, and what makes
+`from_changeset(a.merge(b))` agree with sequential `from_changeset(a).apply_changeset(b)`. Outside
+that precondition, `merge` resolves silently toward `self`, and building the union then loading it
+can succeed even though applying the same two changesets in sequence would be rejected with
+`HeightConflict`. `merge` stays infallible rather than growing a `MergeError`, because the
+consistency boundary is the graph, not the changeset: a `BlockGraph` never
+accepts a hash at two heights regardless of how the conflicting data arrived, so a height conflict
+that only shows up at merge time is a caller error to fix upstream, not a case for `merge` itself to
+report. It's surfaced via `debug_assert` in debug builds precisely because it's expected to never
+fire on legitimate input.
+
 **Alternatives**
 
 Some alternatives have been considered for implementing a skiplist, discussed here
