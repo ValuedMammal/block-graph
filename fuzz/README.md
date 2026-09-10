@@ -33,12 +33,13 @@ keeping is too large to want in a library's git history. `cargo fuzz run` grows 
 finds new coverage; `just fuzz-cmin <target>` prunes it back to one input per coverage class.
 
 [`.github/workflows/fuzz.yml`](../.github/workflows/fuzz.yml) builds every target on each PR and
-runs each for 60s. The real fuzzing happens in the nightly scheduled run (30 minutes per target),
-which is also the only run that *writes* the corpus cache: it `cmin`s the corpus and saves it under
-a key scoped to the default branch, so it compounds night over night and PR runs start warm instead
-of rediscovering "forks exist" every time. PR runs restore that cache but never save, so a PR can't
-poison the shared corpus. Crash artifacts are uploaded on failure. The nightly toolchain is pinned
-in that workflow's `env`, so bumping it is a deliberate, reviewable change.
+runs each briefly as a smoke test; see that workflow for the current durations. The real fuzzing
+happens in the nightly scheduled run, which is also the only run that *writes* the corpus cache: it
+`cmin`s the corpus and saves it under a key scoped to the default branch, so it compounds night over
+night and PR runs start warm instead of rediscovering "forks exist" every time. PR runs restore that
+cache but never save, so a PR can't poison the shared corpus. Crash artifacts are uploaded on
+failure. The nightly toolchain is pinned in that workflow's `env`, so bumping it is a deliberate,
+reviewable change.
 
 ## How the fuzzers see the graph
 
