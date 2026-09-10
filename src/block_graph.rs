@@ -969,9 +969,33 @@ impl<T> Default for ChangeSet<T> {
 }
 
 impl<T> ChangeSet<T> {
-    /// Merge
+    /// Merges `other` into `self`.
+    ///
+    /// This is append-only, not a plain union: if a hash is already recorded in `self`, its
+    /// `(height, value)` is kept and the incoming entry for that hash is skipped, rather than
+    /// overwriting it. `edges` are unioned as normal.
+    ///
+    /// Changesets that descend from a common [`BlockGraph`] lineage never disagree on the height
+    /// of a shared hash, so in practice this behaves like a plain union.
+    ///
+    /// **Known limitation:** for changesets from unrelated sources that *do* disagree on a
+    /// height, `merge` resolves silently toward `self` instead of reporting the conflict, and
+    /// `from_changeset(a.merge(b))` can therefore succeed even though sequential application
+    /// (`from_changeset(a).apply_changeset(b)`) would reject it with `HeightConflict`.
+    /// Consistency is enforced by [`BlockGraph`], not by `merge`; a height conflict is a caller
+    /// error, and is only surfaced (via `debug_assert`) in debug builds.
     pub fn merge(&mut self, other: Self) {
-        self.blocks.extend(other.blocks);
+        for (hash, (height, value)) in other.blocks {
+            match self.blocks.get(&hash) {
+                Some((existing_height, _)) => debug_assert_eq!(
+                    *existing_height, height,
+                    "changesets disagree on the height of {hash}",
+                ),
+                None => {
+                    self.blocks.insert(hash, (height, value));
+                }
+            }
+        }
         self.edges.extend(other.edges);
     }
 
@@ -3267,5 +3291,154 @@ mod test {
         assert_eq!(rebuilt, graph, "and it must round-trip back to the original");
         rebuilt.check_invariants().unwrap();
         rebuilt.check_best_tip().unwrap();
+    }
+
+    #[test]
+    fn merge_is_idempotent() {
+        let (graph, _) = graph_with_branch(3, 1);
+        let mut a = graph.initial_changeset();
+        let expected = a.clone();
+
+        a.merge(a.clone());
+
+        assert_eq!(a, expected, "merging a changeset into itself must be a no-op");
+    }
+
+    #[test]
+    fn merge_preserves_existing_block_binding() {
+        let genesis = genesis_header();
+        let hash = header(genesis.block_hash(), Some(1)).block_hash();
+        let original = header(genesis.block_hash(), Some(2));
+        let incoming = header(genesis.block_hash(), Some(3));
+
+        let mut a = ChangeSet {
+            blocks: [(hash, (5u32, original))].into(),
+            edges: BTreeSet::new(),
+        };
+        let b = ChangeSet {
+            blocks: [(hash, (5u32, incoming))].into(),
+            edges: BTreeSet::new(),
+        };
+
+        a.merge(b);
+
+        assert_eq!(
+            a.blocks.get(&hash),
+            Some(&(5u32, original)),
+            "self's existing binding for a hash must survive an incoming entry at the same height"
+        );
+    }
+
+    #[test]
+    fn merge_is_commutative_for_compatible_changesets() {
+        // Two branches off the same genesis: every shared hash (just genesis itself) agrees on
+        // height, so the changesets are compatible and merge order must not matter.
+        let (a_graph, _) = graph_with_branch(2, 1);
+        let (b_graph, _) = graph_with_branch(3, 101);
+        let a = a_graph.initial_changeset();
+        let b = b_graph.initial_changeset();
+
+        let mut ab = a.clone();
+        ab.merge(b.clone());
+        let mut ba = b;
+        ba.merge(a);
+
+        assert_eq!(ab, ba);
+    }
+
+    #[test]
+    fn merge_unions_edges() {
+        let genesis = genesis_header();
+        let genesis_hash = genesis.block_hash();
+        let child = header(genesis_hash, Some(1));
+        let child_hash = child.block_hash();
+        // An edge whose parent has no block data anywhere in either changeset.
+        let dangling_parent = header(genesis_hash, Some(99)).block_hash();
+
+        let mut a = ChangeSet {
+            blocks: [(genesis_hash, (0u32, genesis)), (child_hash, (1u32, child))].into(),
+            edges: [(genesis_hash, child_hash)].into(),
+        };
+        let b = ChangeSet::<Header> {
+            blocks: BTreeMap::new(),
+            edges: [(dangling_parent, child_hash)].into(),
+        };
+
+        a.merge(b);
+
+        assert!(a.edges.contains(&(genesis_hash, child_hash)));
+        assert!(
+            a.edges.contains(&(dangling_parent, child_hash)),
+            "an edge survives merge even if its parent has no block data"
+        );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "disagree on the height")]
+    fn merge_asserts_on_conflicting_height() {
+        let value = header(BlockHash::all_zeros(), Some(1));
+        let hash = value.block_hash();
+
+        let mut a = ChangeSet {
+            blocks: [(hash, (5u32, value))].into(),
+            edges: BTreeSet::new(),
+        };
+        let b = ChangeSet {
+            blocks: [(hash, (9u32, value))].into(),
+            edges: BTreeSet::new(),
+        };
+
+        a.merge(b);
+    }
+
+    #[test]
+    fn merged_conflict_diverges_from_sequential_apply() {
+        // Pins the documented limitation: `x` is bound to two different heights across `a` and
+        // `b`. Merged into one union it's still a legal changeset, but applying the two
+        // sequentially is exactly the case `BlockGraph` is supposed to catch. This divergence is
+        // known and deliberate: consistency is enforced by the graph, not by `ChangeSet::merge`.
+        let genesis = genesis_header();
+        let genesis_hash = genesis.block_hash();
+        let x = header(genesis_hash, Some(1));
+        let x_hash = x.block_hash();
+        let y = header(x_hash, Some(2));
+        let y_hash = y.block_hash();
+
+        let a = ChangeSet {
+            blocks: [(genesis_hash, (0u32, genesis)), (x_hash, (5u32, x))].into(),
+            edges: [(genesis_hash, x_hash)].into(),
+        };
+        let b = ChangeSet {
+            blocks: [(x_hash, (9u32, x)), (y_hash, (10u32, y))].into(),
+            edges: [(x_hash, y_hash)].into(),
+        };
+
+        // Built by hand, not via `a.clone().merge(b.clone())`: with `x` bound to two different
+        // heights, `merge` would trip its `debug_assert` instead of producing a value.
+        let mut union_blocks = a.blocks.clone();
+        for (hash, entry) in b.blocks.clone() {
+            union_blocks.entry(hash).or_insert(entry);
+        }
+        let union = ChangeSet {
+            blocks: union_blocks,
+            edges: a.edges.iter().chain(&b.edges).copied().collect(),
+        };
+
+        assert!(
+            BlockGraph::from_changeset(union).is_ok(),
+            "the merged union is still a legal changeset"
+        );
+
+        let mut graph = BlockGraph::from_changeset(a).unwrap().unwrap();
+        assert_eq!(
+            graph.apply_changeset(b),
+            Err(ApplyChangeSetError::ConnectBlock(ConnectBlockError::HeightConflict {
+                hash: x_hash,
+                existing_height: 5,
+                new_height: 9,
+            })),
+            "sequential application enforces the consistency the merged union does not"
+        );
     }
 }
