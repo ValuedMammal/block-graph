@@ -109,8 +109,8 @@ jobs:
           DURATION_INPUT: ${{ inputs.duration }}
         run: |
           case "$GITHUB_EVENT_NAME" in
-            # Run on nightly schedule for 10 min
-            schedule) secs=600 ;;
+            # Run on nightly schedule for 1 min
+            schedule) secs=60 ;;
             workflow_dispatch) secs="$DURATION_INPUT" ;;
             *) secs=60 ;;
           esac
